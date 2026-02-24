@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """
 Run Mistral 7B few-shot classification on the validation set.
-Reads cleaned.tsv and dev par_ids, outputs dev.txt (binary 0/1 per line) and dev_results.txt (metrics + incorrect par_ids).
+Reads cleaned.tsv and dev par_ids. Outputs:
+  - dev.txt (binary 0/1 per line)
+  - dev_04.txt (class 0-4 per line)
+  - dev_results.txt (metrics + incorrect par_ids).
 """
 
 import argparse
@@ -18,7 +21,11 @@ def class_04_to_binary(c: int) -> int:
     """Map class 0-4 to binary: 0-1 -> 0, 2-4 -> 1."""
     if c in (0, 1):
         return 0
-    return 1
+    elif c in (2, 3, 4):
+        return 1
+    else:
+        print(f"Error: invalid class {c}")
+        return 1
 
 
 class ConstrainedDigitLogitsProcessor(LogitsProcessor):
@@ -45,6 +52,7 @@ def get_digit_token_ids(tokenizer):
         tid_space = tokenizer.convert_tokens_to_ids(" " + d)
         if tid_space != tokenizer.unk_token_id:
             ids.add(tid_space)
+    print(f"Digit token ids: {ids} with length {len(ids)}")
     return list(ids)
 
 
@@ -68,6 +76,7 @@ def load_cleaned_data(data_path: str):
         for line in f:
             parts = line.strip().split("\t")
             if len(parts) < 3:
+                print(f"ERROR: Expected 3 columns, got {len(parts)}")
                 continue
             par_id = int(parts[0])
             text = parts[1]
@@ -86,7 +95,9 @@ def load_few_shot_examples(pcl_path: str):
     with open(pcl_path, "r", encoding="utf-8") as f:
         lines = f.readlines()
     # Data rows for par_id 1,2,3 are at 1-based lines 5,6,7 -> 0-based indices 4,5,6
-    for i in (4, 5, 6):
+    # After changing this 
+    FEW_SHOT_EXAMPLE_INDICES = (4, 12, 36, 37, 121)
+    for i in FEW_SHOT_EXAMPLE_INDICES:
         if i >= len(lines):
             break
         parts = lines[i].strip().split("\t")
@@ -134,6 +145,35 @@ def tokenize_with_chat_template(tokenizer, prompt: str, max_length: int, device=
         attention_mask = attention_mask.to(device)
     return input_ids, attention_mask
 
+def tokenize_batch_with_chat_template(tokenizer, prompts: list, max_length: int, device):
+    """Tokenize a list of prompts with chat template and return left-padded batch (input_ids, attention_mask)."""
+    pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
+    list_of_ids = []
+    for prompt in prompts:
+        messages = [{"role": "user", "content": prompt}]
+        ids = tokenizer.apply_chat_template(
+            messages,
+            tokenize=True,
+            add_generation_prompt=True,
+            truncation=True,
+            max_length=max_length,
+        )
+        # TODO: remove this
+        # if isinstance(ids, torch.Tensor):
+        #     print("Warning: ids is a tensor")
+        #     ids = ids.tolist()
+        list_of_ids.append(ids)
+    max_len_batch = max(len(ids) for ids in list_of_ids)
+    padded_ids = []
+    for ids in list_of_ids:
+        pad_len = max_len_batch - len(ids)
+        padded = [pad_id] * pad_len + ids
+        padded_ids.append(torch.tensor(padded, dtype=torch.long))
+    input_ids = torch.stack(padded_ids).to(device)
+    # False for padding tokens, True for non-padding tokens
+    attention_mask = (input_ids != pad_id).long()
+    return input_ids, attention_mask
+
 
 def main():
     parser = argparse.ArgumentParser(description="Mistral 7B few-shot classification on dev set")
@@ -162,6 +202,12 @@ def main():
         help="Output path for binary predictions (one 0 or 1 per line)",
     )
     parser.add_argument(
+        "--output_dev_04",
+        type=str,
+        default="dev_04.txt",
+        help="Output path for 0-4 class predictions (one 0/1/2/3/4 per line)",
+    )
+    parser.add_argument(
         "--output_metrics",
         type=str,
         default="dev_results.txt",
@@ -181,6 +227,7 @@ def main():
     random.seed(args.seed)
     torch.manual_seed(args.seed)
     if torch.cuda.is_available():
+        print(f"Using GPU: {torch.cuda.get_device_name(0)}")
         torch.cuda.manual_seed_all(args.seed)
 
     # Load dev par_ids
@@ -194,6 +241,8 @@ def main():
         if par_id in all_data:
             text, label = all_data[par_id]
             validation_list.append((par_id, text, label))
+        else:
+            print(f"ERROR: {par_id} not found in cleaned data")
     print(f"Validation samples (in cleaned): {len(validation_list)}")
 
     # Gold binary labels (from cleaned col3: 0-4 -> 0/1)
@@ -202,8 +251,6 @@ def main():
 
     # Few-shot examples
     few_shot = load_few_shot_examples(args.pcl_path)
-    if len(few_shot) != 3:
-        print(f"Warning: expected 3 few-shot examples, got {len(few_shot)}")
     print(f"Few-shot examples: {len(few_shot)}")
 
     # Load model and tokenizer
@@ -215,39 +262,49 @@ def main():
         device_map="auto" if torch.cuda.is_available() else None,
         trust_remote_code=True,
     )
-    model.eval()
+    model.eval() # set model to evaluation mode
 
     digit_token_ids = get_digit_token_ids(tokenizer)
     if len(digit_token_ids) < 5:
-        print("Warning: could not resolve all 5 digit token ids, using", digit_token_ids)
+        print("Error: could not resolve all 5 digit token ids, using", digit_token_ids)
     logits_processor = ConstrainedDigitLogitsProcessor(digit_token_ids)
 
-    # Generate predictions
+    # Generate predictions (batched)
     predictions_04 = []
     device = next(model.parameters()).device
     max_len = getattr(model.config, "max_position_embeddings", 32768) - 8
-    for par_id, text, _ in tqdm(validation_list, desc="Generating"):
-        prompt = build_prompt(few_shot, text)
+    batch_size = max(1, args.batch_size)
+    prompt = build_prompt(few_shot, validation_list[0][1])
+    print(f"Example Prompt: {prompt}")
+    print(f"Batch size: {batch_size}")
+
+    for start in tqdm(range(0, len(validation_list), batch_size), desc="Generating"):
+        batch_items = validation_list[start : start + batch_size]
+        batch_prompts = [build_prompt(few_shot, text) for _, text, _ in batch_items]
         try:
-            input_ids, attention_mask = tokenize_with_chat_template(
-                tokenizer, prompt, max_length=max_len, device=device
+            input_ids, attention_mask = tokenize_batch_with_chat_template(
+                tokenizer, batch_prompts, max_length=max_len, device=device
             )
         except Exception:
-            # Fallback if no chat template
-            inputs = tokenizer(
-                prompt,
-                return_tensors="pt",
-                truncation=True,
-                max_length=max_len,
-            )
-            input_ids = inputs["input_ids"].to(device)
-            attention_mask = inputs.get("attention_mask")
-            if attention_mask is not None:
-                attention_mask = attention_mask.to(device)
-        if input_ids.dim() == 1:
-            input_ids = input_ids.unsqueeze(0)
-        if attention_mask is not None and attention_mask.dim() == 1:
-            attention_mask = attention_mask.unsqueeze(0)
+            # Fallback if no chat template: tokenize each and left-pad manually
+            pad_id = tokenizer.pad_token_id or tokenizer.eos_token_id
+            list_of_ids = []
+            for prompt in batch_prompts:
+                inputs = tokenizer(
+                    prompt,
+                    truncation=True,
+                    max_length=max_len,
+                    return_tensors=None,
+                )
+                list_of_ids.append(inputs["input_ids"])
+            max_len_batch = max(len(ids) for ids in list_of_ids)
+            padded_ids = []
+            for ids in list_of_ids:
+                pad_len = max_len_batch - len(ids)
+                padded = [pad_id] * pad_len + ids
+                padded_ids.append(torch.tensor(padded, dtype=torch.long))
+            input_ids = torch.stack(padded_ids).to(device)
+            attention_mask = (input_ids != pad_id).long()
 
         with torch.no_grad():
             out = model.generate(
@@ -259,15 +316,15 @@ def main():
                 logits_processor=[logits_processor],
             )
 
-        new_token_id = out[0, -1].item()
-        decoded = tokenizer.decode([new_token_id]).strip()
-        # Parse digit: allow "0"-"4" or single digit from decoded string
-        pred_04 = 0
-        for char in decoded:
-            if char in "01234":
-                pred_04 = int(char)
-                break
-        predictions_04.append(pred_04)
+        for i in range(out.size(0)):
+            new_token_id = out[i, -1].item()
+            decoded = tokenizer.decode([new_token_id]).strip()
+            pred_04 = 0
+            for char in decoded:
+                if char in "01234":
+                    pred_04 = int(char)
+                    break
+            predictions_04.append(pred_04)
 
     # Map to binary
     pred_binary = [class_04_to_binary(p) for p in predictions_04]
@@ -277,6 +334,12 @@ def main():
         for b in pred_binary:
             f.write(f"{b}\n")
     print(f"Wrote {args.output_dev} ({len(pred_binary)} lines)")
+
+    # Write dev_04.txt (one line per validation sample, class 0-4)
+    with open(args.output_dev_04, "w", encoding="utf-8") as f:
+        for p in predictions_04:
+            f.write(f"{p}\n")
+    print(f"Wrote {args.output_dev_04} ({len(predictions_04)} lines)")
 
     # Metrics (binary: positive class = 1)
     tp = sum(1 for p, g in zip(pred_binary, gold_binary) if p == 1 and g == 1)
