@@ -111,8 +111,13 @@ def load_few_shot_examples(pcl_path: str):
 def build_prompt(few_shot: list, text: str) -> str:
     """Build few-shot prompt: task + 3 examples + current text, ending with 'Class:'."""
     prompt = (
+        "You will be given a text from a paragraph. You need to identify whether "
+        "the paragraph contains language that is patronizing or condescending "
+        "towards vulnerable communities. This type of language is also known as "
+        "PCL (Patronizing and Condescending Language). "
         "Classify the following text into a single class 0, 1, 2, 3, or 4 "
-        "(0 = no PCL, 4 = strongest PCL). Reply with only one digit.\n\n"
+        "(0 = no PCL, 4 = strongest PCL). Reply with only one digit. "
+        "Here are some examples:\n\n"
     )
     for ex_text, ex_class in few_shot:
         prompt += f"Text: {ex_text}\nClass: {ex_class}\n\n"
