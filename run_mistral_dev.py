@@ -117,8 +117,9 @@ def build_prompt(few_shot: list, text: str) -> str:
         "PCL (Patronizing and Condescending Language). "
         "Classify the following text into a single class 0, 1, 2, 3, or 4 "
         "(0 = no PCL, 4 = strongest PCL). Reply with only one digit. "
-        "Here are some examples:\n\n"
     )
+    if few_shot:
+        prompt += "Here are some examples:\n\n"
     for ex_text, ex_class in few_shot:
         prompt += f"Text: {ex_text}\nClass: {ex_class}\n\n"
     prompt += f"Text: {text}\nClass:"
