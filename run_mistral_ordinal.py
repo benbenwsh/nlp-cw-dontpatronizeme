@@ -295,9 +295,8 @@ def _get_latest_checkpoint(output_dir: str) -> Optional[str]:
     return max(checkpoints, key=step)
 
 
-def _compute_eval_metrics(eval_preds, save_dir: Optional[str] = None, epoch: Optional[int] = None) -> dict:
-    """Compute binary F1 and accuracy (0-1 vs 2-4) from Trainer eval predictions. predictions = logits (N, 4), label_ids = (N,) 0-4.
-    If save_dir and epoch are set, write predictions to eval_epoch{N}_dev.txt and eval_epoch{N}_dev_04.txt."""
+def _compute_eval_metrics(eval_preds) -> dict:
+    """Compute binary F1 and accuracy (0-1 vs 2-4) from Trainer eval predictions. predictions = logits (N, 4), label_ids = (N,) 0-4."""
     predictions, label_ids = eval_preds.predictions, eval_preds.label_ids
     logits = torch.tensor(predictions, dtype=torch.float32)
     preds_04 = compute_metrics_from_logits(logits)
@@ -311,17 +310,6 @@ def _compute_eval_metrics(eval_preds, save_dir: Optional[str] = None, epoch: Opt
     recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
     f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
     accuracy = (tp + tn) / len(gold_binary) if gold_binary else 0.0
-    if save_dir is not None and epoch is not None:
-        os.makedirs(save_dir, exist_ok=True)
-        path_dev = os.path.join(save_dir, f"eval_epoch{epoch}_dev.txt")
-        path_dev_04 = os.path.join(save_dir, f"eval_epoch{epoch}_dev_04.txt")
-        with open(path_dev, "w", encoding="utf-8") as f:
-            for b in pred_binary:
-                f.write(f"{b}\n")
-        with open(path_dev_04, "w", encoding="utf-8") as f:
-            for p in preds_04:
-                f.write(f"{p.item()}\n")
-        print(f"Wrote {path_dev} and {path_dev_04}")
     return {"eval_f1": f1, "eval_accuracy": accuracy}
 
 
@@ -429,21 +417,13 @@ def train_ordinal(args, tokenizer, train_examples, few_shot):
         report_to="none",
     )
 
-    eval_epoch_counter = [0]
-
-    def _compute_metrics_with_save(eval_preds):
-        eval_epoch_counter[0] += 1
-        return _compute_eval_metrics(
-            eval_preds, save_dir=args.head_save_path, epoch=eval_epoch_counter[0]
-        )
-
     trainer = Trainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
         data_collator=data_collator,
-        compute_metrics=_compute_metrics_with_save,
+        compute_metrics=_compute_eval_metrics,
     )
     resume_from = None
     if args.resume:
