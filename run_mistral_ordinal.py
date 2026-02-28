@@ -409,7 +409,6 @@ def train_ordinal(args, tokenizer, train_examples, few_shot):
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         bf16=torch.cuda.is_available(),
         fp16=False,
-        logging_steps=args.logging_steps,
         logging_strategy="epoch",
         eval_strategy="epoch",
         save_strategy="epoch",
@@ -550,7 +549,6 @@ def main():
     parser.add_argument("--num_epochs", type=int, default=3)
     parser.add_argument("--train_batch_size", type=int, default=4)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=4)
-    parser.add_argument("--logging_steps", type=int, default=50)
     parser.add_argument("--batch_size", type=int, default=8, help="Batch size for validation")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
