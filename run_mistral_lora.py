@@ -41,7 +41,7 @@ def class_04_to_binary(c: int) -> int:
     elif c in (2, 3, 4):
         return 1
     else:
-        print(f"Error: invalid class {c}")
+        print(f"ERROR: invalid class {c}")
         return 1
 
 
@@ -82,28 +82,17 @@ def load_dev_par_ids(dev_path: str) -> List[int]:
     return dev_ids
 
 
-def load_pcl_train(pcl_path: str, exclude_par_ids: List[int]) -> List[Tuple[str, int]]:
+def load_pcl_train(data_path: str, exclude_par_ids: List[int]) -> List[Tuple[str, int]]:
     """
-    Load PCL TSV (skip first 4 lines). Return list of (text, label) for rows
+    Load training data from cleaned.tsv. Return list of (text, label) for rows
     whose par_id is not in exclude_par_ids.
     """
     exclude = set(exclude_par_ids)
+    all_data = load_cleaned_data(data_path)
     examples = []
-    with open(pcl_path, "r", encoding="utf-8") as f:
-        lines = f.readlines()
-    # Skip 4-line disclaimer; data starts at index 4
-    for line in lines[4:]:
-        parts = line.strip().split("\t")
-        if len(parts) < 6:
-            continue
-        try:
-            par_id = int(parts[0])
-        except ValueError:
-            continue
+    for par_id, (text, label) in all_data.items():
         if par_id in exclude:
             continue
-        text = parts[4]
-        label = int(parts[5])
         if label not in (0, 1, 2, 3, 4):
             continue
         examples.append((text, label))
@@ -125,19 +114,20 @@ def load_cleaned_data(data_path: str) -> dict:
     return data
 
 
-def load_few_shot_examples(pcl_path: str) -> List[Tuple[str, int]]:
-    """Load fixed few-shot examples from PCL (same indices as run_mistral_dev)."""
+def load_few_shot_examples(data_path: str) -> List[Tuple[str, int]]:
+    """Load fixed few-shot examples from cleaned.tsv (same line indices as before)."""
     examples = []
-    with open(pcl_path, "r", encoding="utf-8") as f:
-        lines = f.readlines()
-    FEW_SHOT_EXAMPLE_INDICES = (4, 12, 36, 37, 121)
-    for i in FEW_SHOT_EXAMPLE_INDICES:
-        if i >= len(lines):
-            break
-        parts = lines[i].strip().split("\t")
-        if len(parts) >= 6:
-            text = parts[4]
-            label = int(parts[5])
+    FEW_SHOT_EXAMPLE_INDICES = (0, 8, 32, 33, 117)
+    with open(data_path, "r", encoding="utf-8") as f:
+        for i, line in enumerate(f):
+            if i not in FEW_SHOT_EXAMPLE_INDICES:
+                continue
+            parts = line.strip().split("\t")
+            if len(parts) < 3:
+                print(f"ERROR: invalid line {line}")
+                continue
+            text = parts[1]
+            label = int(parts[2])
             examples.append((text, label))
     return examples
 
@@ -458,7 +448,6 @@ def main():
     parser = argparse.ArgumentParser(
         description="LoRA fine-tune Mistral on PCL (excl. dev), save adapter, run validation"
     )
-    parser.add_argument("--pcl_path", type=str, default="dontpatronizeme_pcl.tsv")
     parser.add_argument("--dev_path", type=str, default="dev_semeval_parids-labels.csv")
     parser.add_argument("--data_path", type=str, default="output/cleaned.tsv")
     parser.add_argument("--model_name", type=str, default="mistralai/Mistral-7B-Instruct-v0.2")
@@ -497,10 +486,10 @@ def main():
     dev_ids = load_dev_par_ids(args.dev_path)
     print(f"Loaded {len(dev_ids)} dev par_ids from {args.dev_path}")
 
-    train_examples = load_pcl_train(args.pcl_path, dev_ids)
+    train_examples = load_pcl_train(args.data_path, dev_ids)
     print(f"Training examples (PCL minus dev): {len(train_examples)}")
 
-    few_shot = load_few_shot_examples(args.pcl_path) if args.few_shot else []
+    few_shot = load_few_shot_examples(args.data_path) if args.few_shot else []
     if args.few_shot:
         print(f"Using {len(few_shot)} few-shot examples")
     else:
