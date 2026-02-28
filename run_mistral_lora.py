@@ -142,7 +142,7 @@ def build_prompt(few_shot: List[Tuple[str, int]], text: str) -> str:
 
 
 def tokenize_batch_with_chat_template(tokenizer, prompts: List[str], max_length: int, device):
-    """Tokenize prompts with chat template; return left-padded batch (input_ids, attention_mask)."""
+    """Tokenize prompts with chat template; return right-padded batch (input_ids, attention_mask)."""
     pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
     list_of_ids = []
     for prompt in prompts:
@@ -154,12 +154,16 @@ def tokenize_batch_with_chat_template(tokenizer, prompts: List[str], max_length:
             truncation=True,
             max_length=max_length,
         )
-        list_of_ids.append(ids)
+        prompt_ids = ids["input_ids"]
+        prompt_ids = [int(x) for x in prompt_ids]
+        list_of_ids.append(prompt_ids)
+    
+    # Adding padding
     max_len_batch = max(len(ids) for ids in list_of_ids)
     padded_ids = []
     for ids in list_of_ids:
         pad_len = max_len_batch - len(ids)
-        padded = [pad_id] * pad_len + ids
+        padded = ids + [pad_id] * pad_len
         padded_ids.append(torch.tensor(padded, dtype=torch.long))
     input_ids = torch.stack(padded_ids).to(device)
     attention_mask = (input_ids != pad_id).long()
@@ -351,37 +355,15 @@ def run_validation(args, tokenizer, few_shot):
     digit_token_ids = get_digit_token_ids(tokenizer)
     logits_processor = ConstrainedDigitLogitsProcessor(digit_token_ids)
     device = next(model.parameters()).device
-    max_len = getattr(model.config, "max_position_embeddings", 32768) - 8
     batch_size = max(1, args.batch_size)
 
     predictions_04 = []
     for start in tqdm(range(0, len(validation_list), batch_size), desc="Generating"):
         batch_items = validation_list[start : start + batch_size]
         batch_prompts = [build_prompt(few_shot, text) for _, text, _ in batch_items]
-        try:
-            input_ids, attention_mask = tokenize_batch_with_chat_template(
-                tokenizer, batch_prompts, max_length=max_len, device=device
-            )
-        except Exception:
-            pad_id = tokenizer.pad_token_id or tokenizer.eos_token_id
-            list_of_ids = []
-            for prompt in batch_prompts:
-                inputs = tokenizer(
-                    prompt,
-                    truncation=True,
-                    max_length=max_len,
-                    return_tensors=None,
-                )
-                list_of_ids.append(inputs["input_ids"])
-            max_len_batch = max(len(ids) for ids in list_of_ids)
-            padded_ids = []
-            for ids in list_of_ids:
-                pad_len = max_len_batch - len(ids)
-                padded = [pad_id] * pad_len + ids
-                padded_ids.append(torch.tensor(padded, dtype=torch.long))
-            input_ids = torch.stack(padded_ids).to(device)
-            attention_mask = (input_ids != pad_id).long()
-
+        input_ids, attention_mask = tokenize_batch_with_chat_template(
+            tokenizer, batch_prompts, max_length=args.max_length, device=device
+        )
         with torch.no_grad():
             out = model.generate(
                 input_ids=input_ids,
@@ -475,6 +457,11 @@ def main():
     parser.add_argument("--lora_alpha", type=int, default=16)
     parser.add_argument("--batch_size", type=int, default=1, help="Batch size for validation generation")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--eval_only",
+        action="store_true",
+        help="Skip training; load saved adapter and run validation only",
+    )
     args = parser.parse_args()
 
     random.seed(args.seed)
@@ -485,9 +472,6 @@ def main():
 
     dev_ids = load_dev_par_ids(args.dev_path)
     print(f"Loaded {len(dev_ids)} dev par_ids from {args.dev_path}")
-
-    train_examples = load_pcl_train(args.data_path, dev_ids)
-    print(f"Training examples (PCL minus dev): {len(train_examples)}")
 
     few_shot = load_few_shot_examples(args.data_path) if args.few_shot else []
     if args.few_shot:
@@ -500,11 +484,16 @@ def main():
         tokenizer.pad_token = tokenizer.eos_token
         tokenizer.pad_token_id = tokenizer.eos_token_id
 
-    # Phase 1 & 2: Train LoRA and save
-    train_lora(args, tokenizer, train_examples, few_shot)
-
-    # Phase 3: Validation
-    run_validation(args, tokenizer, few_shot)
+    if args.eval_only:
+        print("Eval-only mode: skipping training, running validation with saved adapter.")
+        run_validation(args, tokenizer, few_shot)
+    else:
+        train_examples = load_pcl_train(args.data_path, dev_ids)
+        print(f"Training examples (PCL minus dev): {len(train_examples)}")
+        # Phase 1 & 2: Train LoRA and save
+        train_lora(args, tokenizer, train_examples, few_shot)
+        # Phase 3: Validation
+        run_validation(args, tokenizer, few_shot)
 
 
 if __name__ == "__main__":

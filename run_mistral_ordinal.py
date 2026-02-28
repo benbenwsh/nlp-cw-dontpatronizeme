@@ -121,7 +121,7 @@ def build_prompt(few_shot: List[Tuple[str, int]], text: str) -> str:
 
 
 def tokenize_batch_with_chat_template(tokenizer, prompts: List[str], max_length: int, device):
-    """Tokenize prompts with chat template; return left-padded batch (input_ids, attention_mask)."""
+    """Tokenize prompts with chat template; return right-padded batch (input_ids, attention_mask)."""
     pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
     list_of_ids = []
     for prompt in prompts:
@@ -131,11 +131,10 @@ def tokenize_batch_with_chat_template(tokenizer, prompts: List[str], max_length:
             tokenize=True,
             add_generation_prompt=True,
             truncation=True,
-            max_length=max_length,
+            max_length=max_length, # My use case rarely exceeds even the default 2048 args.max_length
         ) # of type BatchEncoding, similar to dictionary
         prompt_ids = ids["input_ids"]
         prompt_ids = [int(x) for x in prompt_ids]
-        print(f"Length of prompt_ids: {len(prompt_ids)}")
         list_of_ids.append(prompt_ids)
 
     # Adding padding
@@ -143,7 +142,7 @@ def tokenize_batch_with_chat_template(tokenizer, prompts: List[str], max_length:
     padded_ids = []
     for ids in list_of_ids:
         pad_len = max_len_batch - len(ids)
-        padded = [pad_id] * pad_len + ids
+        padded = ids + [pad_id] * pad_len 
         padded_ids.append(torch.tensor(padded, dtype=torch.long))
     input_ids = torch.stack(padded_ids).to(device)
     attention_mask = (input_ids != pad_id).long()
@@ -343,6 +342,20 @@ def _plot_train_eval_loss(trainer, save_dir: str) -> None:
     if not epochs:
         return
     os.makedirs(save_dir, exist_ok=True)
+
+    # Write per-epoch metrics to a txt file
+    metrics_path = os.path.join(save_dir, "metrics_per_epoch.txt")
+    with open(metrics_path, "w", encoding="utf-8") as f:
+        f.write("Epoch\tTrain loss\tEval loss\tEval F1\tEval accuracy\n")
+        for i, e in enumerate(epochs):
+            train_loss = train_losses[i] if i < len(train_losses) else float("nan")
+            eval_idx = eval_epochs.index(e) if e in eval_epochs else None
+            eval_loss = eval_losses[eval_idx] if eval_idx is not None else float("nan")
+            eval_f1 = eval_f1s[eval_idx] if eval_idx is not None and eval_idx < len(eval_f1s) else float("nan")
+            eval_acc = eval_accuracies[eval_idx] if eval_idx is not None and eval_idx < len(eval_accuracies) else float("nan")
+            f.write(f"{e}\t{train_loss:.4f}\t{eval_loss:.4f}\t{eval_f1:.4f}\t{eval_acc:.4f}\n")
+    print(f"Saved {metrics_path}")
+
     fig, ax = plt.subplots()
     ax.plot(epochs, train_losses, marker="o", linestyle="-")
     ax.set_xlabel("Epoch")
@@ -412,7 +425,7 @@ def train_ordinal(args, tokenizer, train_examples, few_shot):
         logging_strategy="epoch",
         eval_strategy="epoch",
         save_strategy="epoch",
-        save_total_limit=1,
+        save_total_limit=1, # max no of checkpoints to keep
         report_to="none",
     )
 

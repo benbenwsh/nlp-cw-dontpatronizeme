@@ -173,6 +173,7 @@ def tokenize_batch_with_chat_template(tokenizer, prompts: list, max_length: int,
     padded_ids = []
     for ids in list_of_ids:
         pad_len = max_len_batch - len(ids)
+        # Left padded
         padded = [pad_id] * pad_len + ids
         padded_ids.append(torch.tensor(padded, dtype=torch.long))
     input_ids = torch.stack(padded_ids).to(device)
