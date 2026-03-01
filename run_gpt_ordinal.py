@@ -1,32 +1,32 @@
 #!/usr/bin/env python3
 """
-LoRA fine-tune Mistral 7B on PCL data (excluding dev set), save PEFT adapter,
-then run validation on dev set. Supports --few_shot (default: no few-shot).
+Train only an ordinal regression head on frozen Mistral-7B-Instruct-v0.2 for PCL
+classification (5 ordered classes 0-4). No LoRA; LM head is not used. Uses last-token
+hidden state and CORAL ordinal regression (coral-pytorch).
 """
 
-import os
-import time
 import argparse
 import csv
+import glob
+import os
 import random
+import re
+import time
 from collections import defaultdict
 from typing import List, Optional, Tuple
 
-import numpy as np
-import torch
 import matplotlib.pyplot as plt
+
+import torch
+import torch.nn as nn
 from torch.utils.data import Dataset
 from tqdm import tqdm
-from transformers import (
-    AutoModelForCausalLM,
-    AutoTokenizer,
-    Trainer,
-    TrainingArguments,
-)
-from transformers.generation.logits_process import LogitsProcessor
-from peft import LoraConfig, get_peft_model, PeftModel
+from transformers import AutoModelForCausalLM, AutoTokenizer, Trainer, TrainingArguments
+from coral_pytorch.layers import CoralLayer
+from coral_pytorch.losses import coral_loss
+from coral_pytorch.dataset import levels_from_labelbatch, proba_to_label
 
-# --- Helpers (self-contained, same behaviour as run_mistral_dev) ---
+# --- Data loading and prompt helpers (same as run_gpt_lora.py) ---
 
 INSTRUCTION = (
     "You will be given a text from a paragraph. You need to identify whether "
@@ -36,6 +36,8 @@ INSTRUCTION = (
     "Classify the following text into a single class 0, 1, 2, 3, or 4 "
     "(0 = no PCL, 4 = strongest PCL). Reply with only one digit. "
 )
+
+NUM_CLASSES = 5
 
 
 def class_04_to_binary(c: int) -> int:
@@ -47,33 +49,6 @@ def class_04_to_binary(c: int) -> int:
     else:
         print(f"ERROR: invalid class {c}")
         return 1
-
-
-class ConstrainedDigitLogitsProcessor(LogitsProcessor):
-    """Restrict next token to single-token digits 0, 1, 2, 3, 4 only."""
-
-    def __init__(self, allowed_token_ids):
-        self.allowed_token_ids = set(allowed_token_ids)
-
-    def __call__(self, input_ids, scores):
-        mask = torch.ones_like(scores, dtype=torch.bool)
-        mask[:, list(self.allowed_token_ids)] = False
-        scores.masked_fill_(mask, float("-inf"))
-        return scores
-
-
-def get_digit_token_ids(tokenizer):
-    """Return token ids for '0','1','2','3','4' (with and without leading space)."""
-    digits = ["0", "1", "2", "3", "4"]
-    ids = set()
-    for d in digits:
-        tid = tokenizer.convert_tokens_to_ids(d)
-        if tid != tokenizer.unk_token_id:
-            ids.add(tid)
-        tid_space = tokenizer.convert_tokens_to_ids(" " + d)
-        if tid_space != tokenizer.unk_token_id:
-            ids.add(tid_space)
-    return list(ids)
 
 
 def load_dev_par_ids(dev_path: str) -> List[int]:
@@ -119,7 +94,7 @@ def load_cleaned_data(data_path: str) -> dict:
 
 
 def load_few_shot_examples(data_path: str) -> List[Tuple[str, int]]:
-    """Load fixed few-shot examples from cleaned.tsv (same line indices as before)."""
+    """Load fixed few-shot examples from cleaned.tsv."""
     examples = []
     FEW_SHOT_EXAMPLE_INDICES = (0, 8, 32, 33, 117)
     with open(data_path, "r", encoding="utf-8") as f:
@@ -156,29 +131,29 @@ def tokenize_batch_with_chat_template(tokenizer, prompts: List[str], max_length:
             tokenize=True,
             add_generation_prompt=True,
             truncation=True,
-            max_length=max_length,
-        )
+            max_length=max_length, # My use case rarely exceeds even the default 2048 args.max_length
+        ) # of type BatchEncoding, similar to dictionary
         prompt_ids = ids["input_ids"]
         prompt_ids = [int(x) for x in prompt_ids]
         list_of_ids.append(prompt_ids)
-    
+
     # Adding padding
     max_len_batch = max(len(ids) for ids in list_of_ids)
     padded_ids = []
     for ids in list_of_ids:
         pad_len = max_len_batch - len(ids)
-        padded = ids + [pad_id] * pad_len
+        padded = ids + [pad_id] * pad_len 
         padded_ids.append(torch.tensor(padded, dtype=torch.long))
     input_ids = torch.stack(padded_ids).to(device)
     attention_mask = (input_ids != pad_id).long()
     return input_ids, attention_mask
 
 
-# --- Training dataset: prompt + label, labels mask prompt with -100 ---
+# --- Dataset: prompt only, no answer token; label is 0-4 ---
 
 
-class PCLDataCollator:
-    """Pad batch to longest sequence; pad labels with -100 so loss ignores them."""
+class OrdinalDataCollator:
+    """Pad batch to longest sequence; only input_ids and attention_mask (no LM labels)."""
 
     def __init__(self, tokenizer, pad_to_multiple_of=8):
         self.tokenizer = tokenizer
@@ -195,46 +170,31 @@ class PCLDataCollator:
         batch["labels"] = []
         for f in features:
             pad_len = max_len - len(f["input_ids"])
-            # Right-pad so causal LM sees real tokens first
             input_ids = f["input_ids"].tolist() + [self.pad_id] * pad_len
             attention_mask = f["attention_mask"].tolist() + [0] * pad_len
-            labels = f["labels"].tolist() + [-100] * pad_len
             batch["input_ids"].append(torch.tensor(input_ids, dtype=torch.long))
             batch["attention_mask"].append(torch.tensor(attention_mask, dtype=torch.long))
-            batch["labels"].append(torch.tensor(labels, dtype=torch.long))
+            batch["labels"].append(f["labels"])
         batch["input_ids"] = torch.stack(batch["input_ids"])
         batch["attention_mask"] = torch.stack(batch["attention_mask"])
         batch["labels"] = torch.stack(batch["labels"])
         return batch
 
 
-def get_label_token_id(tokenizer, label: int) -> int:
-    """Get single token id for class 0-4 (prefer space+digit if available)."""
-    for s in (" " + str(label), str(label)):
-        tid = tokenizer.convert_tokens_to_ids(s)
-        if tid != tokenizer.unk_token_id:
-            print("ERROR: could not find label token id for", label)
-            return tid
-    return tokenizer.convert_tokens_to_ids(str(label))
-
-
-class PCLDataset(Dataset):
-    """Dataset of (input_ids, attention_mask, labels) for causal LM; labels are -100 on prompt."""
+class PCLOrdinalDataset(Dataset):
+    """Dataset of (input_ids, attention_mask, label) for ordinal head; prompt only, no answer token."""
 
     def __init__(
         self,
-        examples: List[Tuple[str, int]], # List of (text, label) tuples
+        examples: List[Tuple[str, int]],
         tokenizer,
-        max_length: int,
+        max_length: int, # max length of the prompt
         few_shot: List[Tuple[str, int]],
     ):
         self.tokenizer = tokenizer
         self.max_length = max_length
         self.few_shot = few_shot
         self.examples = examples
-        self.label_token_ids = [get_label_token_id(tokenizer, i) for i in range(5)]
-        pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
-        self.pad_id = pad_id
 
     def __len__(self):
         return len(self.examples)
@@ -242,68 +202,106 @@ class PCLDataset(Dataset):
     def __getitem__(self, idx):
         text, label = self.examples[idx]
         prompt_text = build_prompt(self.few_shot, text)
-        # Tokenize prompt (user message + generation prompt, no answer yet)
         messages = [{"role": "user", "content": prompt_text}]
         out = self.tokenizer.apply_chat_template(
             messages,
             tokenize=True,
             add_generation_prompt=True,
             truncation=True,
-            max_length=self.max_length - 2, # -2 for the answer token
+            max_length=self.max_length,
         )
-        # Handle BatchEncoding (newer transformers) or list
-        prompt_ids = out["input_ids"]
-        prompt_ids = list(prompt_ids)
 
-        answer_token_id = self.label_token_ids[label]
-        input_ids = prompt_ids + [answer_token_id]
-        if len(input_ids) > self.max_length:
-            print("ERROR: input_ids length is greater than max_length")
-            input_ids = input_ids[: self.max_length]
-        prompt_len = len(prompt_ids)
-        labels = [-100] * prompt_len + [answer_token_id]
-        if len(labels) > self.max_length:
-            print("ERROR: labels length is greater than max_length")
-            labels = labels[: self.max_length]
-        # No padding: return at actual length; collator will pad per batch
-        attention_mask = [1] * len(input_ids)
+        prompt_ids = out["input_ids"]
+        prompt_ids = [int(x) for x in prompt_ids]
+
+        # No padding because only considering one example
+        attention_mask = [1] * len(prompt_ids)
         return {
-            "input_ids": torch.tensor(input_ids, dtype=torch.long),
+            "input_ids": torch.tensor(prompt_ids, dtype=torch.long),
             "attention_mask": torch.tensor(attention_mask, dtype=torch.long),
-            "labels": torch.tensor(labels, dtype=torch.long),
+            "labels": torch.tensor(label, dtype=torch.long),
         }
 
 
-def _compute_eval_metrics(eval_preds, tokenizer) -> dict:
-    """Compute binary F1 and accuracy (0-1 vs 2-4) from Trainer eval. predictions = logits (N, L, V), label_ids = (N, L) with -100 on prompt/pad."""
+# --- Model: frozen Mistral + ordinal head (CORAL) ---
+
+
+class MistralOrdinalModel(nn.Module):
+    """
+    Frozen Mistral backbone + trainable CORAL ordinal head.
+    Uses last-token hidden state from the transformer (no LM head).
+    """
+
+    def __init__(self, model_name: str, num_classes: int = 5):
+        super().__init__()
+        self.num_classes = num_classes
+        self.backbone = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
+            device_map="cuda:0" if torch.cuda.is_available() else None,
+            trust_remote_code=True,
+        )
+        self.backbone.requires_grad_(False) # Freeze GPT backbone
+        hidden_size = self.backbone.config.hidden_size # Feature dimension (4096 for Mistral-7B-v0.2)
+        self.ordinal_head = CoralLayer(size_in=hidden_size, num_classes=num_classes)
+        # Place head on same device as backbone output (last layer) when using device_map="auto"
+        if torch.cuda.is_available():
+            last_layer_device = next(self.backbone.model.layers[-1].parameters()).device
+            self.ordinal_head.to(last_layer_device)
+
+    def forward(
+        self,
+        input_ids=None,
+        attention_mask=None,
+        labels=None,
+        **kwargs,
+    ):
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=torch.cuda.is_available()):
+            outputs = self.backbone.model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                return_dict=True,
+            )
+        last_hidden = outputs.last_hidden_state # last token's hidden state
+        batch_size = last_hidden.size(0) # First dimension is the batch size
+        last_pos = attention_mask.sum(dim=1) - 1
+        device = last_hidden.device
+        last_token_hidden = last_hidden[torch.arange(batch_size, device=device), last_pos, :]
+        if last_token_hidden.dtype == torch.bfloat16:
+            last_token_hidden = last_token_hidden.float()
+        logits = self.ordinal_head(last_token_hidden) # (batch, num_classes-1)
+
+        if labels is not None:
+            levels = levels_from_labelbatch(labels, num_classes=self.num_classes, dtype=logits.dtype).to(logits.device)
+            loss = coral_loss(logits, levels)
+            return {"loss": loss, "logits": logits}
+        return {"logits": logits}
+
+
+def compute_metrics_from_logits(logits: torch.Tensor) -> torch.Tensor:
+    """Convert CORAL logits to class predictions 0-4. logits shape (batch, num_classes-1)."""
+    probas = torch.sigmoid(logits)
+    return proba_to_label(probas)
+
+
+def _get_latest_checkpoint(output_dir: str) -> Optional[str]:
+    """Return path to the latest checkpoint in output_dir (checkpoint-XXXX), or None if none found."""
+    checkpoints = glob.glob(os.path.join(output_dir, "checkpoint-*"))
+    if not checkpoints:
+        return None
+    def step(path: str) -> int:
+        m = re.search(r"checkpoint-(\d+)$", path.rstrip(os.sep))
+        return int(m.group(1)) if m else 0
+    return max(checkpoints, key=step)
+
+
+def _compute_eval_metrics(eval_preds) -> dict:
+    """Compute binary F1 and accuracy (0-1 vs 2-4) from Trainer eval predictions. predictions = logits (N, 4), label_ids = (N,) 0-4."""
     predictions, label_ids = eval_preds.predictions, eval_preds.label_ids
-    print(f"Predictions: {predictions}")
-    print(f"Label IDs: {label_ids}")
-    if isinstance(predictions, tuple):
-        predictions = predictions[0]
-    preds = np.array(predictions)
-    labels = np.array(label_ids)
-    # Logits at last position: (N, L, V) -> (N, V) (N=batch size, L=sequence length, V=vocabulary size)
-    if preds.ndim == 3:
-        logits_last = preds[:, -1, :]
-    else:
-        logits_last = preds
-    N = logits_last.shape[0]
-    label_token_ids = [get_label_token_id(tokenizer, k) for k in range(5)]
-    token_id_to_class = {tid: k for k, tid in enumerate(label_token_ids)}
-    # Predicted class: argmax over the 5 digit token logits
-    preds_04 = []
-    for i in range(N):
-        scores = [logits_last[i, tid] for tid in label_token_ids]
-        preds_04.append(int(np.argmax(scores)))
-    # Gold: last non -100 in each row
-    gold_04 = []
-    for i in range(N):
-        valid = np.where(labels[i] != -100)[0]
-        gold_token = int(labels[i, valid[-1]]) if len(valid) > 0 else -100
-        gold_04.append(token_id_to_class.get(gold_token, 0))
-    pred_binary = [class_04_to_binary(p) for p in preds_04]
-    gold_binary = [class_04_to_binary(int(g)) for g in gold_04]
+    logits = torch.tensor(predictions, dtype=torch.float32)
+    preds_04 = compute_metrics_from_logits(logits)
+    pred_binary = [class_04_to_binary(p.item()) for p in preds_04]
+    gold_binary = [class_04_to_binary(int(l)) for l in label_ids]
     tp = sum(1 for p, g in zip(pred_binary, gold_binary) if p == 1 and g == 1)
     tn = sum(1 for p, g in zip(pred_binary, gold_binary) if p == 0 and g == 0)
     fp = sum(1 for p, g in zip(pred_binary, gold_binary) if p == 1 and g == 0)
@@ -316,7 +314,7 @@ def _compute_eval_metrics(eval_preds, tokenizer) -> dict:
 
 
 def _plot_train_eval_loss(trainer, save_dir: str) -> None:
-    """Extract train loss, eval loss, eval F1, and eval accuracy per epoch from trainer.state.log_history; save four plots and metrics_per_epoch.txt."""
+    """Extract train loss, eval loss, eval F1, and eval accuracy per epoch from trainer.state.log_history; save four plots."""
     train_loss_by_epoch = defaultdict(list)
     eval_epochs, eval_losses, eval_f1s, eval_accuracies = [], [], [], []
     for entry in trainer.state.log_history:
@@ -333,6 +331,7 @@ def _plot_train_eval_loss(trainer, save_dir: str) -> None:
         return
     os.makedirs(save_dir, exist_ok=True)
 
+    # Write per-epoch metrics to a txt file
     metrics_path = os.path.join(save_dir, "metrics_per_epoch.txt")
     with open(metrics_path, "w", encoding="utf-8") as f:
         f.write("Epoch\tTrain loss\tEval loss\tEval F1\tEval accuracy\n")
@@ -364,7 +363,7 @@ def _plot_train_eval_loss(trainer, save_dir: str) -> None:
         fig2.savefig(os.path.join(save_dir, "eval_loss_vs_epoch.png"), dpi=150, bbox_inches="tight")
         plt.close(fig2)
         print(f"Saved {os.path.join(save_dir, 'eval_loss_vs_epoch.png')}")
-    if eval_epochs and not all(f != f for f in eval_f1s):
+    if eval_epochs and not all(f != f for f in eval_f1s):  # at least one non-NaN F1
         fig3, ax3 = plt.subplots()
         ax3.plot(eval_epochs, eval_f1s, marker="o", linestyle="-", color="C2")
         ax3.set_xlabel("Epoch")
@@ -374,7 +373,7 @@ def _plot_train_eval_loss(trainer, save_dir: str) -> None:
         fig3.savefig(os.path.join(save_dir, "eval_f1_vs_epoch.png"), dpi=150, bbox_inches="tight")
         plt.close(fig3)
         print(f"Saved {os.path.join(save_dir, 'eval_f1_vs_epoch.png')}")
-    if eval_epochs and not all(a != a for a in eval_accuracies):
+    if eval_epochs and not all(a != a for a in eval_accuracies):  # at least one non-NaN accuracy
         fig4, ax4 = plt.subplots()
         ax4.plot(eval_epochs, eval_accuracies, marker="o", linestyle="-", color="C3")
         ax4.set_xlabel("Epoch")
@@ -386,43 +385,25 @@ def _plot_train_eval_loss(trainer, save_dir: str) -> None:
         print(f"Saved {os.path.join(save_dir, 'eval_accuracy_vs_epoch.png')}")
 
 
-def train_lora(args, tokenizer, train_examples, few_shot):
-    """Load base model, apply LoRA, train, save adapter."""
-    print("Loading base model for training...")
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model_name,
-        torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
-        device_map="auto" if torch.cuda.is_available() else None,
-        trust_remote_code=True,
-    )
-    lora_config = LoraConfig(
-        r=args.lora_r,
-        lora_alpha=args.lora_alpha,
-        target_modules=["q_proj", "v_proj", "k_proj", "o_proj"],
-        lora_dropout=0.05,
-        bias="none",
-        task_type="CAUSAL_LM",
-    )
-    model = get_peft_model(model, lora_config)
-    print("Printing trainable parameters...")
-    model.print_trainable_parameters()
+def train_ordinal(args, tokenizer, train_examples, few_shot):
+    """Load frozen Mistral + ordinal head, train head only, save head and tokenizer."""
+    print("Loading base model (frozen) and ordinal head...")
+    model = MistralOrdinalModel(args.model_name, num_classes=NUM_CLASSES)
+    model.train()
+    n_trainable = sum(p.numel() for p in model.ordinal_head.parameters() if p.requires_grad)
+    print(f"Trainable parameters (ordinal head only): {n_trainable}")
 
-    max_length = args.max_length
-    train_dataset = PCLDataset(train_examples, tokenizer, max_length, few_shot)
-    # Eval dataset from dev set (same as ordinal)
+    train_dataset = PCLOrdinalDataset(train_examples, tokenizer, args.max_length, few_shot)
     dev_ids = load_dev_par_ids(args.dev_path)
     all_data = load_cleaned_data(args.data_path)
-    eval_examples = [(all_data[par_id][0], all_data[par_id][1]) for par_id in dev_ids if par_id in all_data]
-    eval_dataset = PCLDataset(eval_examples, tokenizer, max_length, few_shot)
+    eval_examples = [all_data[par_id] for par_id in dev_ids]
+    eval_dataset = PCLOrdinalDataset(eval_examples, tokenizer, args.max_length, few_shot)
     print(f"Eval examples (dev): {len(eval_dataset)}")
 
-    data_collator = PCLDataCollator(tokenizer=tokenizer, pad_to_multiple_of=8)
-
-    def compute_metrics(eval_preds):
-        return _compute_eval_metrics(eval_preds, tokenizer)
+    data_collator = OrdinalDataCollator(tokenizer=tokenizer, pad_to_multiple_of=8)
 
     training_args = TrainingArguments(
-        output_dir=args.adapter_save_path,
+        output_dir=args.head_save_path,
         num_train_epochs=args.num_epochs,
         per_device_train_batch_size=args.train_batch_size,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
@@ -431,10 +412,9 @@ def train_lora(args, tokenizer, train_examples, few_shot):
         logging_strategy="epoch",
         eval_strategy="epoch",
         save_strategy="epoch",
-        save_total_limit=1,
+        save_total_limit=1, # max no of checkpoints to keep
         report_to="none",
     )
-    print("Training with batch size:", args.train_batch_size, "number of epochs:", args.num_epochs)
 
     trainer = Trainer(
         model=model,
@@ -442,31 +422,38 @@ def train_lora(args, tokenizer, train_examples, few_shot):
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
         data_collator=data_collator,
-        compute_metrics=compute_metrics,
+        compute_metrics=_compute_eval_metrics,
     )
+    resume_from = None
+    if args.resume:
+        resume_from = _get_latest_checkpoint(args.head_save_path)
+        if resume_from:
+            print(f"Resuming training from {resume_from}")
+        else:
+            print(f"WARNING: --resume set but no checkpoint found in {args.head_save_path}; training from scratch")
     time_start = time.time()
-    trainer.train()
+    trainer.train(resume_from_checkpoint=resume_from)
     time_end = time.time()
-    print(f"Training time: {time_end - time_start} seconds")
+    print(f"Training time: {time_end - time_start:.1f} seconds")
 
-    _plot_train_eval_loss(trainer, args.adapter_save_path)
+    _plot_train_eval_loss(trainer, args.head_save_path)
 
-    model.save_pretrained(args.adapter_save_path)
-    tokenizer.save_pretrained(args.adapter_save_path)
-    print(f"Saved adapter and tokenizer to {args.adapter_save_path}")
+    os.makedirs(args.head_save_path, exist_ok=True)
+    torch.save(model.ordinal_head.state_dict(), os.path.join(args.head_save_path, "ordinal_head.pt"))
+    tokenizer.save_pretrained(args.head_save_path)
+    print(f"Saved ordinal head and tokenizer to {args.head_save_path}")
     return model
 
 
 def run_validation(args, tokenizer, few_shot):
-    """Load base + adapter, run validation, write dev.txt, dev_04.txt, dev_results.txt."""
-    print("Loading base model and adapter for validation...")
-    base_model = AutoModelForCausalLM.from_pretrained(
-        args.model_name,
-        torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
-        device_map="auto" if torch.cuda.is_available() else None,
-        trust_remote_code=True,
-    )
-    model = PeftModel.from_pretrained(base_model, args.adapter_save_path)
+    """Load frozen Mistral + trained ordinal head, run on dev set, write predictions and metrics."""
+    print("Loading base model and ordinal head for validation...")
+    model = MistralOrdinalModel(args.model_name, num_classes=NUM_CLASSES)
+    head_path = os.path.join(args.head_save_path, "ordinal_head.pt")
+    model.ordinal_head.load_state_dict(torch.load(head_path, map_location="cpu", weights_only=True))
+    if torch.cuda.is_available():
+        last_layer_device = next(model.backbone.model.layers[-1].parameters()).device
+        model.ordinal_head.to(last_layer_device)
     model.eval()
 
     dev_ids = load_dev_par_ids(args.dev_path)
@@ -477,45 +464,27 @@ def run_validation(args, tokenizer, few_shot):
             text, label = all_data[par_id]
             validation_list.append((par_id, text, label))
         else:
-            print(f"WARNING: par_id {par_id} not in cleaned data")
+            print(f"ERROR: par_id {par_id} not in cleaned data")
     print(f"Validation samples: {len(validation_list)}")
 
     gold_binary = [class_04_to_binary(l) for (_, _, l) in validation_list]
     par_ids_ordered = [p for (p, _, _) in validation_list]
-
-    digit_token_ids = get_digit_token_ids(tokenizer)
-    logits_processor = ConstrainedDigitLogitsProcessor(digit_token_ids)
     device = next(model.parameters()).device
     batch_size = max(1, args.batch_size)
 
     predictions_04 = []
-    for start in tqdm(range(0, len(validation_list), batch_size), desc="Generating"):
+    for start in tqdm(range(0, len(validation_list), batch_size), desc="Validating"):
         batch_items = validation_list[start : start + batch_size]
         batch_prompts = [build_prompt(few_shot, text) for _, text, _ in batch_items]
         input_ids, attention_mask = tokenize_batch_with_chat_template(
             tokenizer, batch_prompts, max_length=args.max_length, device=device
         )
         with torch.no_grad():
-            out = model.generate(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                max_new_tokens=1,
-                do_sample=False,
-                pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id,
-                logits_processor=[logits_processor],
-            )
-
-        for i in range(out.size(0)):
-            new_token_id = out[i, -1].item()
-            decoded = tokenizer.decode([new_token_id]).strip()
-            pred_04 = 0
-            for char in decoded:
-                if char in "01234":
-                    pred_04 = int(char)
-                    break
-                else:
-                    print(f"Error: invalid character {char} in decoded string {decoded}")
-            predictions_04.append(pred_04)
+            out = model(input_ids=input_ids, attention_mask=attention_mask)
+        logits = out["logits"]
+        preds = compute_metrics_from_logits(logits)
+        for i in range(preds.size(0)):
+            predictions_04.append(preds[i].item())
 
     pred_binary = [class_04_to_binary(p) for p in predictions_04]
 
@@ -537,6 +506,8 @@ def run_validation(args, tokenizer, few_shot):
     precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
     recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
     f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
+    gold_04 = [l for (_, _, l) in validation_list]
+    mae = sum(abs(p - g) for p, g in zip(predictions_04, gold_04)) / len(gold_04) if gold_04 else 0.0
     incorrect_par_ids = [
         par_ids_ordered[i] for i in range(len(par_ids_ordered)) if pred_binary[i] != gold_binary[i]
     ]
@@ -548,49 +519,47 @@ def run_validation(args, tokenizer, few_shot):
         f.write(f"Precision: {precision:.4f}\n")
         f.write(f"Recall:    {recall:.4f}\n")
         f.write(f"F1:        {f1:.4f}\n")
+        f.write(f"MAE (0-4): {mae:.4f}\n")
         f.write("\n")
         f.write(f"Incorrect examples (par_id): {len(incorrect_par_ids)}\n")
         f.write("-" * 50 + "\n")
         for pid in incorrect_par_ids:
             f.write(f"{pid}\n")
     print(f"Wrote {args.output_metrics}")
-    print(f"Accuracy: {accuracy:.4f}, Precision: {precision:.4f}, Recall: {recall:.4f}, F1: {f1:.4f}")
+    print(f"Accuracy: {accuracy:.4f}, Precision: {precision:.4f}, Recall: {recall:.4f}, F1: {f1:.4f}, MAE: {mae:.4f}")
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="LoRA fine-tune Mistral on PCL (excl. dev), save adapter, run validation"
+        description="Train ordinal regression head on frozen Mistral for PCL (0-4), then validate"
     )
     parser.add_argument("--dev_path", type=str, default="dev_semeval_parids-labels.csv")
     parser.add_argument("--data_path", type=str, default="output/cleaned.tsv")
     parser.add_argument("--model_name", type=str, default="mistralai/Mistral-7B-Instruct-v0.2")
-    parser.add_argument("--adapter_save_path", type=str, default="output/mistral_7b_pcl_lora")
+    parser.add_argument("--head_save_path", type=str, default="output/mistral_7b_ordinal_head")
     parser.add_argument("--output_dev", type=str, default="dev.txt")
     parser.add_argument("--output_dev_04", type=str, default="dev_04.txt")
     parser.add_argument("--output_metrics", type=str, default="dev_results.txt")
     parser.add_argument(
         "--few_shot",
         action="store_true",
-        help="Use few-shot examples in training and validation (default: no few-shot)",
+        help="Use few-shot examples in prompt (default: no few-shot)",
     )
-    parser.add_argument(
-        "--max_length",
-        type=int,
-        default=2048,
-        help="Max sequence length for training (truncation only; no padding to this length)",
-    )
+    parser.add_argument("--max_length", type=int, default=2048, help="Max sequence length (truncation)")
     parser.add_argument("--num_epochs", type=int, default=3)
-    # TODO: could maybe tune this to see which one is faster
-    parser.add_argument("--train_batch_size", type=int, default=2) # 4 leads to OOM
+    parser.add_argument("--train_batch_size", type=int, default=4)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=4)
-    parser.add_argument("--lora_r", type=int, default=8)
-    parser.add_argument("--lora_alpha", type=int, default=16)
-    parser.add_argument("--batch_size", type=int, default=1, help="Batch size for validation generation")
+    parser.add_argument("--batch_size", type=int, default=8, help="Batch size for validation")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
         "--eval_only",
         action="store_true",
-        help="Skip training; load saved adapter and run validation only",
+        help="Skip training; load saved ordinal head and run validation only",
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume training from the latest checkpoint in --head_save_path (use with --num_epochs for total epochs)",
     )
     args = parser.parse_args()
 
@@ -615,14 +584,12 @@ def main():
         tokenizer.pad_token_id = tokenizer.eos_token_id
 
     if args.eval_only:
-        print("Eval-only mode: skipping training, running validation with saved adapter.")
+        print("Eval-only mode: skipping training, running validation with saved head.")
         run_validation(args, tokenizer, few_shot)
     else:
         train_examples = load_pcl_train(args.data_path, dev_ids)
         print(f"Training examples (PCL minus dev): {len(train_examples)}")
-        # Phase 1 & 2: Train LoRA and save
-        train_lora(args, tokenizer, train_examples, few_shot)
-        # Phase 3: Validation
+        train_ordinal(args, tokenizer, train_examples, few_shot)
         run_validation(args, tokenizer, few_shot)
 
 

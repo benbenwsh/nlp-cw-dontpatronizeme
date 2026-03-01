@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Run Mistral 7B few-shot classification on the validation set.
+Run causal LM (e.g. Mistral 7B) zero-shot / few-shot on the validation set (no fine-tuning).
 Reads cleaned.tsv and dev par_ids. Outputs:
   - dev.txt (binary 0/1 per line)
   - dev_04.txt (class 0-4 per line)
