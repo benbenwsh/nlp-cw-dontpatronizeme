@@ -4,13 +4,17 @@ LoRA fine-tune Mistral 7B on PCL data (excluding dev set), save PEFT adapter,
 then run validation on dev set. Supports --few_shot (default: no few-shot).
 """
 
+import os
 import time
 import argparse
 import csv
 import random
-from typing import List, Tuple
+from collections import defaultdict
+from typing import List, Optional, Tuple
 
+import numpy as np
 import torch
+import matplotlib.pyplot as plt
 from torch.utils.data import Dataset
 from tqdm import tqdm
 from transformers import (
@@ -270,6 +274,118 @@ class PCLDataset(Dataset):
         }
 
 
+def _compute_eval_metrics(eval_preds, tokenizer) -> dict:
+    """Compute binary F1 and accuracy (0-1 vs 2-4) from Trainer eval. predictions = logits (N, L, V), label_ids = (N, L) with -100 on prompt/pad."""
+    predictions, label_ids = eval_preds.predictions, eval_preds.label_ids
+    print(f"Predictions: {predictions}")
+    print(f"Label IDs: {label_ids}")
+    if isinstance(predictions, tuple):
+        predictions = predictions[0]
+    preds = np.array(predictions)
+    labels = np.array(label_ids)
+    # Logits at last position: (N, L, V) -> (N, V) (N=batch size, L=sequence length, V=vocabulary size)
+    if preds.ndim == 3:
+        logits_last = preds[:, -1, :]
+    else:
+        logits_last = preds
+    N = logits_last.shape[0]
+    label_token_ids = [get_label_token_id(tokenizer, k) for k in range(5)]
+    token_id_to_class = {tid: k for k, tid in enumerate(label_token_ids)}
+    # Predicted class: argmax over the 5 digit token logits
+    preds_04 = []
+    for i in range(N):
+        scores = [logits_last[i, tid] for tid in label_token_ids]
+        preds_04.append(int(np.argmax(scores)))
+    # Gold: last non -100 in each row
+    gold_04 = []
+    for i in range(N):
+        valid = np.where(labels[i] != -100)[0]
+        gold_token = int(labels[i, valid[-1]]) if len(valid) > 0 else -100
+        gold_04.append(token_id_to_class.get(gold_token, 0))
+    pred_binary = [class_04_to_binary(p) for p in preds_04]
+    gold_binary = [class_04_to_binary(int(g)) for g in gold_04]
+    tp = sum(1 for p, g in zip(pred_binary, gold_binary) if p == 1 and g == 1)
+    tn = sum(1 for p, g in zip(pred_binary, gold_binary) if p == 0 and g == 0)
+    fp = sum(1 for p, g in zip(pred_binary, gold_binary) if p == 1 and g == 0)
+    fn = sum(1 for p, g in zip(pred_binary, gold_binary) if p == 0 and g == 1)
+    precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+    recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
+    accuracy = (tp + tn) / len(gold_binary) if gold_binary else 0.0
+    return {"eval_f1": f1, "eval_accuracy": accuracy}
+
+
+def _plot_train_eval_loss(trainer, save_dir: str) -> None:
+    """Extract train loss, eval loss, eval F1, and eval accuracy per epoch from trainer.state.log_history; save four plots and metrics_per_epoch.txt."""
+    train_loss_by_epoch = defaultdict(list)
+    eval_epochs, eval_losses, eval_f1s, eval_accuracies = [], [], [], []
+    for entry in trainer.state.log_history:
+        if "loss" in entry and "eval_loss" not in entry:
+            train_loss_by_epoch[int(entry["epoch"])].append(entry["loss"])
+        if "eval_loss" in entry:
+            eval_epochs.append(int(entry["epoch"]))
+            eval_losses.append(entry["eval_loss"])
+            eval_f1s.append(entry.get("eval_f1", float("nan")))
+            eval_accuracies.append(entry.get("eval_accuracy", float("nan")))
+    epochs = sorted(train_loss_by_epoch.keys())
+    train_losses = [sum(train_loss_by_epoch[e]) / len(train_loss_by_epoch[e]) for e in epochs]
+    if not epochs:
+        return
+    os.makedirs(save_dir, exist_ok=True)
+
+    metrics_path = os.path.join(save_dir, "metrics_per_epoch.txt")
+    with open(metrics_path, "w", encoding="utf-8") as f:
+        f.write("Epoch\tTrain loss\tEval loss\tEval F1\tEval accuracy\n")
+        for i, e in enumerate(epochs):
+            train_loss = train_losses[i] if i < len(train_losses) else float("nan")
+            eval_idx = eval_epochs.index(e) if e in eval_epochs else None
+            eval_loss = eval_losses[eval_idx] if eval_idx is not None else float("nan")
+            eval_f1 = eval_f1s[eval_idx] if eval_idx is not None and eval_idx < len(eval_f1s) else float("nan")
+            eval_acc = eval_accuracies[eval_idx] if eval_idx is not None and eval_idx < len(eval_accuracies) else float("nan")
+            f.write(f"{e}\t{train_loss:.4f}\t{eval_loss:.4f}\t{eval_f1:.4f}\t{eval_acc:.4f}\n")
+    print(f"Saved {metrics_path}")
+
+    fig, ax = plt.subplots()
+    ax.plot(epochs, train_losses, marker="o", linestyle="-")
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("Loss")
+    ax.set_title("Training loss vs epoch")
+    ax.set_xticks(epochs)
+    fig.savefig(os.path.join(save_dir, "train_loss_vs_epoch.png"), dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Saved {os.path.join(save_dir, 'train_loss_vs_epoch.png')}")
+    if eval_epochs:
+        fig2, ax2 = plt.subplots()
+        ax2.plot(eval_epochs, eval_losses, marker="o", linestyle="-", color="C1")
+        ax2.set_xlabel("Epoch")
+        ax2.set_ylabel("Loss")
+        ax2.set_title("Validation loss vs epoch")
+        ax2.set_xticks(eval_epochs)
+        fig2.savefig(os.path.join(save_dir, "eval_loss_vs_epoch.png"), dpi=150, bbox_inches="tight")
+        plt.close(fig2)
+        print(f"Saved {os.path.join(save_dir, 'eval_loss_vs_epoch.png')}")
+    if eval_epochs and not all(f != f for f in eval_f1s):
+        fig3, ax3 = plt.subplots()
+        ax3.plot(eval_epochs, eval_f1s, marker="o", linestyle="-", color="C2")
+        ax3.set_xlabel("Epoch")
+        ax3.set_ylabel("F1")
+        ax3.set_title("Validation F1 vs epoch")
+        ax3.set_xticks(eval_epochs)
+        fig3.savefig(os.path.join(save_dir, "eval_f1_vs_epoch.png"), dpi=150, bbox_inches="tight")
+        plt.close(fig3)
+        print(f"Saved {os.path.join(save_dir, 'eval_f1_vs_epoch.png')}")
+    if eval_epochs and not all(a != a for a in eval_accuracies):
+        fig4, ax4 = plt.subplots()
+        ax4.plot(eval_epochs, eval_accuracies, marker="o", linestyle="-", color="C3")
+        ax4.set_xlabel("Epoch")
+        ax4.set_ylabel("Accuracy")
+        ax4.set_title("Validation accuracy vs epoch")
+        ax4.set_xticks(eval_epochs)
+        fig4.savefig(os.path.join(save_dir, "eval_accuracy_vs_epoch.png"), dpi=150, bbox_inches="tight")
+        plt.close(fig4)
+        print(f"Saved {os.path.join(save_dir, 'eval_accuracy_vs_epoch.png')}")
+
+
 def train_lora(args, tokenizer, train_examples, few_shot):
     """Load base model, apply LoRA, train, save adapter."""
     print("Loading base model for training...")
@@ -293,8 +409,17 @@ def train_lora(args, tokenizer, train_examples, few_shot):
 
     max_length = args.max_length
     train_dataset = PCLDataset(train_examples, tokenizer, max_length, few_shot)
-    # Pad batch to the longest sequence (batch size specified in training_args)
+    # Eval dataset from dev set (same as ordinal)
+    dev_ids = load_dev_par_ids(args.dev_path)
+    all_data = load_cleaned_data(args.data_path)
+    eval_examples = [(all_data[par_id][0], all_data[par_id][1]) for par_id in dev_ids if par_id in all_data]
+    eval_dataset = PCLDataset(eval_examples, tokenizer, max_length, few_shot)
+    print(f"Eval examples (dev): {len(eval_dataset)}")
+
     data_collator = PCLDataCollator(tokenizer=tokenizer, pad_to_multiple_of=8)
+
+    def compute_metrics(eval_preds):
+        return _compute_eval_metrics(eval_preds, tokenizer)
 
     training_args = TrainingArguments(
         output_dir=args.adapter_save_path,
@@ -303,7 +428,8 @@ def train_lora(args, tokenizer, train_examples, few_shot):
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         bf16=torch.cuda.is_available(),
         fp16=False,
-        logging_steps=args.logging_steps,
+        logging_strategy="epoch",
+        eval_strategy="epoch",
         save_strategy="epoch",
         save_total_limit=1,
         report_to="none",
@@ -314,12 +440,17 @@ def train_lora(args, tokenizer, train_examples, few_shot):
         model=model,
         args=training_args,
         train_dataset=train_dataset,
+        eval_dataset=eval_dataset,
         data_collator=data_collator,
+        compute_metrics=compute_metrics,
     )
     time_start = time.time()
     trainer.train()
     time_end = time.time()
     print(f"Training time: {time_end - time_start} seconds")
+
+    _plot_train_eval_loss(trainer, args.adapter_save_path)
+
     model.save_pretrained(args.adapter_save_path)
     tokenizer.save_pretrained(args.adapter_save_path)
     print(f"Saved adapter and tokenizer to {args.adapter_save_path}")
@@ -450,9 +581,8 @@ def main():
     )
     parser.add_argument("--num_epochs", type=int, default=3)
     # TODO: could maybe tune this to see which one is faster
-    parser.add_argument("--train_batch_size", type=int, default=4)
+    parser.add_argument("--train_batch_size", type=int, default=2) # 4 leads to OOM
     parser.add_argument("--gradient_accumulation_steps", type=int, default=4)
-    parser.add_argument("--logging_steps", type=int, default=50)
     parser.add_argument("--lora_r", type=int, default=8)
     parser.add_argument("--lora_alpha", type=int, default=16)
     parser.add_argument("--batch_size", type=int, default=1, help="Batch size for validation generation")
