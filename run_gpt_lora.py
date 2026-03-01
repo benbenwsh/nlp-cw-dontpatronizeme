@@ -17,10 +17,12 @@ import torch
 import matplotlib.pyplot as plt
 from torch.utils.data import Dataset
 from tqdm import tqdm
+from torch.utils.data import DataLoader
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
     Trainer,
+    TrainerCallback,
     TrainingArguments,
 )
 from transformers.generation.logits_process import LogitsProcessor
@@ -213,9 +215,8 @@ def get_label_token_id(tokenizer, label: int) -> int:
     for s in (" " + str(label), str(label)):
         tid = tokenizer.convert_tokens_to_ids(s)
         if tid != tokenizer.unk_token_id:
-            print("ERROR: could not find label token id for", label)
             return tid
-    return tokenizer.convert_tokens_to_ids(str(label))
+    print(f"ERROR: could not find label token id for {label}")
 
 
 class PCLDataset(Dataset):
@@ -274,45 +275,117 @@ class PCLDataset(Dataset):
         }
 
 
-def _compute_eval_metrics(eval_preds, tokenizer) -> dict:
-    """Compute binary F1 and accuracy (0-1 vs 2-4) from Trainer eval. predictions = logits (N, L, V), label_ids = (N, L) with -100 on prompt/pad."""
-    predictions, label_ids = eval_preds.predictions, eval_preds.label_ids
-    print(f"Predictions: {predictions}")
-    print(f"Label IDs: {label_ids}")
-    if isinstance(predictions, tuple):
-        predictions = predictions[0]
-    preds = np.array(predictions)
-    labels = np.array(label_ids)
-    # Logits at last position: (N, L, V) -> (N, V) (N=batch size, L=sequence length, V=vocabulary size)
-    if preds.ndim == 3:
-        logits_last = preds[:, -1, :]
-    else:
-        logits_last = preds
-    N = logits_last.shape[0]
-    label_token_ids = [get_label_token_id(tokenizer, k) for k in range(5)]
-    token_id_to_class = {tid: k for k, tid in enumerate(label_token_ids)}
-    # Predicted class: argmax over the 5 digit token logits
-    preds_04 = []
-    for i in range(N):
-        scores = [logits_last[i, tid] for tid in label_token_ids]
-        preds_04.append(int(np.argmax(scores)))
-    # Gold: last non -100 in each row
-    gold_04 = []
-    for i in range(N):
-        valid = np.where(labels[i] != -100)[0]
-        gold_token = int(labels[i, valid[-1]]) if len(valid) > 0 else -100
-        gold_04.append(token_id_to_class.get(gold_token, 0))
-    pred_binary = [class_04_to_binary(p) for p in preds_04]
-    gold_binary = [class_04_to_binary(int(g)) for g in gold_04]
-    tp = sum(1 for p, g in zip(pred_binary, gold_binary) if p == 1 and g == 1)
-    tn = sum(1 for p, g in zip(pred_binary, gold_binary) if p == 0 and g == 0)
-    fp = sum(1 for p, g in zip(pred_binary, gold_binary) if p == 1 and g == 0)
-    fn = sum(1 for p, g in zip(pred_binary, gold_binary) if p == 0 and g == 1)
-    precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
-    recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
-    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
-    accuracy = (tp + tn) / len(gold_binary) if gold_binary else 0.0
-    return {"eval_f1": f1, "eval_accuracy": accuracy}
+# def _compute_eval_metrics(eval_preds, tokenizer) -> dict:
+#     """Compute binary F1 and accuracy (0-1 vs 2-4) from Trainer eval. predictions = logits (N, L, V), label_ids = (N, L) with -100 on prompt/pad."""
+#     predictions, label_ids = eval_preds.predictions, eval_preds.label_ids
+#     if isinstance(predictions, tuple):
+#         predictions = predictions[0]
+#     preds = np.array(predictions)
+#     labels = np.array(label_ids)
+#     # Logits at last position: (N, L, V) -> (N, V) (N=batch size, L=sequence length, V=vocabulary size)
+#     if preds.ndim == 3:
+#         logits_last = preds[:, -1, :]
+#     else:
+#         logits_last = preds
+#     N = logits_last.shape[0]
+#     label_token_ids = [get_label_token_id(tokenizer, k) for k in range(5)]
+#     token_id_to_class = {tid: k for k, tid in enumerate(label_token_ids)}
+#     # Predicted class: argmax over the 5 digit token logits
+#     preds_04 = []
+#     for i in range(N):
+#         scores = [logits_last[i, tid] for tid in label_token_ids]
+#         preds_04.append(int(np.argmax(scores)))
+#     # Gold: last non -100 in each row
+#     gold_04 = []
+#     for i in range(N):
+#         valid = np.where(labels[i] != -100)[0]
+#         gold_token = int(labels[i, valid[-1]]) if len(valid) > 0 else -100
+#         gold_04.append(token_id_to_class.get(gold_token, 0))
+#     pred_binary = [class_04_to_binary(p) for p in preds_04]
+#     gold_binary = [class_04_to_binary(int(g)) for g in gold_04]
+#     tp = sum(1 for p, g in zip(pred_binary, gold_binary) if p == 1 and g == 1)
+#     tn = sum(1 for p, g in zip(pred_binary, gold_binary) if p == 0 and g == 0)
+#     fp = sum(1 for p, g in zip(pred_binary, gold_binary) if p == 1 and g == 0)
+#     fn = sum(1 for p, g in zip(pred_binary, gold_binary) if p == 0 and g == 1)
+#     precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+#     recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+#     f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
+#     accuracy = (tp + tn) / len(gold_binary) if gold_binary else 0.0
+#     return {"eval_f1": f1, "eval_accuracy": accuracy}
+
+
+class _MemoryEfficientEvalCallback(TrainerCallback):
+    """Run evaluation at end of each epoch without gathering full logits (avoids OOM)."""
+
+    def __init__(self, eval_dataset, tokenizer, data_collator):
+        self.eval_dataset = eval_dataset
+        self.tokenizer = tokenizer
+        self.data_collator = data_collator
+        self.trainer = None
+
+    def on_epoch_end(self, args, state, control, **kwargs):
+        print(f"Epoch {state.epoch} ended")
+        if self.trainer is None or self.eval_dataset is None:
+            return control
+        model = self.trainer.model
+        model.eval()
+        device = next(model.parameters()).device
+        label_token_ids = [get_label_token_id(self.tokenizer, k) for k in range(5)]
+        token_id_to_class = {tid: k for k, tid in enumerate(label_token_ids)}
+        eval_batch_size = getattr(args, "per_device_eval_batch_size", 8)
+        dataloader = DataLoader(
+            self.eval_dataset,
+            batch_size=eval_batch_size,
+            collate_fn=self.data_collator,
+            shuffle=False,
+        )
+        all_pred_04 = []
+        all_gold_04 = []
+        total_loss = 0.0
+        n_samples = 0
+        with torch.no_grad():
+            for batch in dataloader:
+                batch = {k: v.to(device) for k, v in batch.items() if hasattr(v, "to")}
+                batch_size = batch["input_ids"].size(0)
+                outputs = model(**batch)
+                loss = outputs.loss
+                total_loss += loss.item() * batch_size
+                n_samples += batch_size
+                logits = outputs.logits
+                labels = batch["labels"]
+                # Last non -100 position per row is the answer token
+                last_pos = (labels != -100).long()
+                last_idx = last_pos.sum(dim=1) - 1
+                for i in range(batch_size):
+                    pos = last_idx[i].item()
+                    scores = [logits[i, pos, tid].item() for tid in label_token_ids]
+                    pred_04 = int(np.argmax(scores))
+                    gold_token = labels[i, pos].item()
+                    gold_04 = token_id_to_class.get(gold_token, 0)
+                    all_pred_04.append(pred_04)
+                    all_gold_04.append(gold_04)
+        model.train()
+        eval_loss = total_loss / n_samples if n_samples else 0.0
+        pred_binary = [class_04_to_binary(p) for p in all_pred_04]
+        gold_binary = [class_04_to_binary(int(g)) for g in all_gold_04]
+        tp = sum(1 for p, g in zip(pred_binary, gold_binary) if p == 1 and g == 1)
+        tn = sum(1 for p, g in zip(pred_binary, gold_binary) if p == 0 and g == 0)
+        fp = sum(1 for p, g in zip(pred_binary, gold_binary) if p == 1 and g == 0)
+        fn = sum(1 for p, g in zip(pred_binary, gold_binary) if p == 0 and g == 1)
+        precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+        recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+        f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
+        accuracy = (tp + tn) / len(gold_binary) if gold_binary else 0.0
+        epoch_key = max(0, int(state.epoch) - 1)
+        self.trainer.log(
+            {
+                "eval_loss": eval_loss,
+                "eval_f1": f1,
+                "eval_accuracy": accuracy,
+                "epoch": epoch_key,
+            }
+        )
+        return control
 
 
 def _plot_train_eval_loss(trainer, save_dir: str) -> None:
@@ -419,9 +492,6 @@ def train_lora(args, tokenizer, train_examples, few_shot):
 
     data_collator = PCLDataCollator(tokenizer=tokenizer, pad_to_multiple_of=8)
 
-    def compute_metrics(eval_preds):
-        return _compute_eval_metrics(eval_preds, tokenizer)
-
     training_args = TrainingArguments(
         output_dir=args.adapter_save_path,
         num_train_epochs=args.num_epochs,
@@ -430,21 +500,23 @@ def train_lora(args, tokenizer, train_examples, few_shot):
         bf16=torch.cuda.is_available(),
         fp16=False,
         logging_strategy="epoch",
-        eval_strategy="epoch",
+        eval_strategy="no",
         save_strategy="epoch",
         save_total_limit=1,
         report_to="none",
     )
     print("Training with batch size:", args.train_batch_size, "number of epochs:", args.num_epochs)
 
+    eval_callback = _MemoryEfficientEvalCallback(eval_dataset, tokenizer, data_collator)
     trainer = Trainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
         data_collator=data_collator,
-        compute_metrics=compute_metrics,
+        callbacks=[eval_callback],
     )
+    eval_callback.trainer = trainer
     time_start = time.time()
     trainer.train()
     time_end = time.time()
@@ -582,7 +654,7 @@ def main():
     )
     parser.add_argument("--num_epochs", type=int, default=3)
     # TODO: could maybe tune this to see which one is faster
-    parser.add_argument("--train_batch_size", type=int, default=2) # 4 leads to OOM
+    parser.add_argument("--train_batch_size", type=int, default=8) # 4 leads to OOM
     parser.add_argument("--gradient_accumulation_steps", type=int, default=4)
     parser.add_argument("--lora_r", type=int, default=8)
     parser.add_argument("--lora_alpha", type=int, default=16)
