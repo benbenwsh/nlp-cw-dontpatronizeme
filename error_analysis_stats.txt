@@ -1,0 +1,28 @@
+Error analysis (mistral_7b_pcl_lora_6_epochs dev)
+============================================================
+
+Part 1: Errors by keyword (binary 0/1 wrong)
+----------------------------------------
+  poor-families: incorrect=25, total=190, pct_wrong=13.16%
+  hopeless: incorrect=22, total=217, pct_wrong=10.14%
+  homeless: incorrect=21, total=212, pct_wrong=9.91%
+  in-need: incorrect=13, total=226, pct_wrong=5.75%
+  women: incorrect=12, total=233, pct_wrong=5.15%
+  vulnerable: incorrect=12, total=209, pct_wrong=5.74%
+  disabled: incorrect=10, total=194, pct_wrong=5.15%
+  refugee: incorrect=10, total=188, pct_wrong=5.32%
+  immigrant: incorrect=7, total=218, pct_wrong=3.21%
+  migrant: incorrect=3, total=207, pct_wrong=1.45%
+
+Part 2: Errors by gold class (0-4)
+----------------------------------------
+  Class 0: incorrect=115, total=1704, pct_wrong=6.75%
+  Class 1: incorrect=131, total=191, pct_wrong=68.59%
+  Class 2: incorrect=18, total=18, pct_wrong=100.00%
+  Class 3: incorrect=65, total=89, pct_wrong=73.03%
+  Class 4: incorrect=52, total=92, pct_wrong=56.52%
+
+Part 3: Length (word count) summary
+----------------------------------------
+  Incorrect: n=135, mean=53.8
+  Correct:   n=1959, mean=47.0
