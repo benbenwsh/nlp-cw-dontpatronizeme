@@ -4,7 +4,7 @@ Error analysis for mistral_7b_pcl_lora_6_epochs dev predictions.
 Part 1: Errors by keyword (binary 0/1 wrong).
 Part 2: Errors by gold class 0-4 (count + percentage), two bar charts.
 Part 3: Length distribution (correct vs incorrect).
-Part 4: Predicted class distribution (0-4) among incorrect examples only (bar chart + stats).
+Part 4: Predicted class distribution (0-4) over all dev predictions (bar chart + stats).
 Part 5: Gold class distribution (0-4) in full dev set (bar chart + stats).
 Uses dev_semeval_parids-labels.csv, output/cleaned.tsv, dev_results.txt, dev_04.txt;
 for Part 1 only, dontpatronizeme_pcl.tsv for keyword.
@@ -167,9 +167,8 @@ def main():
         else:
             lengths_correct.append(nwords)
 
-    # --- Part 4 & 5: Predicted class (incorrect only) and gold class (full dev) ---
-    pred_on_incorrect = [pred_04[i] for i in range(len(dev_ids)) if dev_ids[i] in incorrect_par_ids]
-    pred_class_counts = Counter(pred_on_incorrect)
+    # --- Part 4 & 5: Predicted class (all dev) and gold class (full dev) ---
+    pred_class_counts = Counter(pred_04)
     gold_class_counts = Counter(g for g in gold_04 if g >= 0)
 
     # --- Write stats file ---
@@ -203,13 +202,13 @@ def main():
             f.write(f"  Correct:   n={len(lengths_correct)}, mean={sum(lengths_correct)/len(lengths_correct):.1f}\n")
         f.write("\n")
 
-        # Part 4: Predicted class distribution (incorrect examples only)
-        n_incorrect = len(pred_on_incorrect)
-        f.write("Part 4: Predicted class distribution (incorrect examples only)\n")
+        # Part 4: Predicted class distribution (all dev predictions)
+        n_pred = len(pred_04)
+        f.write("Part 4: Predicted class distribution (all dev predictions)\n")
         f.write("-" * 40 + "\n")
         for c in range(5):
             cnt = pred_class_counts.get(c, 0)
-            pct = (100.0 * cnt / n_incorrect) if n_incorrect else 0.0
+            pct = (100.0 * cnt / n_pred) if n_pred else 0.0
             f.write(f"  Class {c}: count={cnt}, pct={pct:.2f}%\n")
         f.write("\n")
 
@@ -312,17 +311,17 @@ def main():
     plt.close()
     print(f"Wrote {out}")
 
-    # Part 4: Predicted class distribution (incorrect examples only)
+    # Part 4: Predicted class distribution (all dev predictions)
     classes = list(range(5))
     pred_counts = [pred_class_counts.get(c, 0) for c in classes]
     fig, ax = plt.subplots()
     ax.bar(classes, pred_counts)
     ax.set_xlabel("Predicted class")
     ax.set_ylabel("Count")
-    ax.set_title("Part 4: Predicted class distribution (incorrect examples only)")
+    ax.set_title("Part 4: Predicted class distribution (all dev predictions)")
     ax.set_xticks(classes)
     plt.tight_layout()
-    out = os.path.join(args.output_dir, "error_analysis_pred_class_incorrect_bars.png")
+    out = os.path.join(args.output_dir, "error_analysis_pred_class_all_dev_bars.png")
     plt.savefig(out, dpi=150)
     plt.close()
     print(f"Wrote {out}")
