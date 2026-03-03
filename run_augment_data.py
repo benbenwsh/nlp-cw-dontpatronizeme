@@ -80,51 +80,60 @@ def build_generation_prompt(seed_text: str, class_label: int) -> str:
     )
 
 
-def tokenize_with_chat_template(
-    tokenizer, prompt: str, max_length: int, device
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Wrap prompt in chat template; return input_ids, attention_mask on device."""
-    messages = [{"role": "user", "content": prompt}]
-    tokenized = tokenizer.apply_chat_template(
-        messages,
-        tokenize=True,
-        add_generation_prompt=True,
-        truncation=True,
-        max_length=max_length,
-        return_tensors="pt",
-    )
-    if not isinstance(tokenized, torch.Tensor):
-        tokenized = torch.tensor(tokenized, dtype=torch.long)
-    if tokenized.dim() == 1:
-        tokenized = tokenized.unsqueeze(0)
-    input_ids = tokenized.to(device)
-    pad_id = (
-        tokenizer.pad_token_id
-        if tokenizer.pad_token_id is not None
-        else tokenizer.eos_token_id
-    )
+def tokenize_batch_with_chat_template(tokenizer, prompts: List[str], max_length: int, device):
+    """Tokenize prompts with chat template; return right-padded batch (input_ids, attention_mask)."""
+    pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
+    list_of_ids = []
+    for prompt in prompts:
+        messages = [{"role": "user", "content": prompt}]
+        ids = tokenizer.apply_chat_template(
+            messages,
+            tokenize=True,
+            add_generation_prompt=True,
+            truncation=True,
+            max_length=max_length,
+        )
+        prompt_ids = ids["input_ids"]
+        prompt_ids = [int(x) for x in prompt_ids]
+        list_of_ids.append(prompt_ids)
+    max_len_batch = max(len(ids) for ids in list_of_ids)
+    padded_ids = []
+    for ids in list_of_ids:
+        pad_len = max_len_batch - len(ids)
+        padded = ids + [pad_id] * pad_len
+        padded_ids.append(torch.tensor(padded, dtype=torch.long))
+    input_ids = torch.stack(padded_ids).to(device)
     attention_mask = (input_ids != pad_id).long()
-    if attention_mask.sum() == 0:
-        attention_mask = torch.ones_like(input_ids)
     return input_ids, attention_mask
 
 
-def generate_one(
-    prompt: str,
+MARKERS = ("new paragraph:", "\n\n")
+
+def _has_marker(text: str) -> bool:
+    """Return True if any of the markers appear in text."""
+    if not text:
+        print(f"ERROR: No text provided")
+        return False
+    return any(m in text.lower() for m in MARKERS)
+
+
+def _generate_batch_once(
+    prompts: List[str],
     model: torch.nn.Module,
     tokenizer: AutoTokenizer,
     device: torch.device,
-    max_new_tokens: int = 256,
-    temperature: float = 0.7,
-    max_prompt_length: int = 2048,
-) -> str:
-    """
-    Generate one new paragraph using the model. Returns the decoded new text only.
-    On empty or invalid output, returns empty string (caller may skip or retry).
-    """
-    input_ids, attention_mask = tokenize_with_chat_template(
-        tokenizer, prompt, max_prompt_length, device
+    max_new_tokens: int,
+    temperature: float,
+    max_prompt_length: int,
+) -> List[str]:
+    """One model call; returns list of raw decoded strings (same length as prompts)."""
+    if not prompts:
+        print("ERROR: No prompts provided")
+        return []
+    input_ids, attention_mask = tokenize_batch_with_chat_template(
+        tokenizer, prompts, max_prompt_length, device
     )
+    prompt_lengths = attention_mask.sum(dim=1).cpu().tolist()
     with torch.no_grad():
         out = model.generate(
             input_ids=input_ids,
@@ -134,22 +143,62 @@ def generate_one(
             temperature=temperature,
             pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id,
         )
-    # Decode only the new tokens
-    # out is of shape (1, L) where L is the length of the generated text
+    results: List[str] = []
+    for i in range(out.size(0)):
+        start = prompt_lengths[i]
+        new_ids = out[i, start:].tolist()
+        if not new_ids:
+            results.append("")
+            continue
+        results.append(tokenizer.decode(new_ids, skip_special_tokens=True))
+    return results
 
-    new_ids = out[0, input_ids.shape[1] :].tolist()
-    if not new_ids:
-        return ""
-    text = tokenizer.decode(new_ids, skip_special_tokens=True).strip()
-    if (input_ids.shape[1] == max_new_tokens):
-        print(f"WARNING: Generated text is the same length as the max_new_tokens: {text}")
 
-    # Heuristic: if model output contains "New paragraph:" or similar, take after it
-    for marker in ("New paragraph:", "new paragraph:", "\n\n"):
-        if marker in text:
-            print(f"WARNING: Found marker {marker} in text: {text}")
-            text = text.split(marker, 1)[-1].strip()
-    return text
+def generate_batch(
+    prompts: List[str],
+    model: torch.nn.Module,
+    tokenizer: AutoTokenizer,
+    device: torch.device,
+    max_new_tokens: int = 256,
+    temperature: float = 0.7,
+    max_prompt_length: int = 2048,
+) -> List[str]:
+    """
+    Generate one new paragraph per prompt. If a marker is found in the output,
+    retry generation once for that item; if still present after retry, return "".
+    Returns a list of decoded new text only (same length as prompts). Empty/invalid become "".
+    """
+    if not prompts:
+        print("ERROR: No prompts provided")
+        return []
+    results_list = _generate_batch_once(
+        prompts, model, tokenizer, device, max_new_tokens, temperature, max_prompt_length
+    )
+    results: List[str] = [""] * len(prompts)
+    retry_list: List[Tuple[int, str]] = []  # (index, prompt)
+    for i, result in enumerate(results_list):
+        result = result.strip()
+        if _has_marker(result):
+            print(f"ERROR: Found marker in generated text (will retry once): {result[:80]}...")
+            retry_list.append((i, prompts[i]))
+        else:
+            results[i] = result
+    if retry_list:
+        retry_indices = [t[0] for t in retry_list]
+        retry_prompts = [t[1] for t in retry_list]
+        retry_results = _generate_batch_once(
+            retry_prompts, model, tokenizer, device, max_new_tokens, temperature, max_prompt_length
+        )
+        for j, idx in enumerate(retry_indices):
+            result = retry_results[j]
+            result = result.strip()
+
+            if _has_marker(result):
+                print(f"WARNING: Retry still had marker or empty; giving up for prompt index {idx}")
+                # results[idx] stays ""
+            else:
+                results[idx] = result
+    return results
 
 
 def main():
@@ -199,6 +248,12 @@ def main():
         type=int,
         default=2048,
         help="Max prompt length (truncation)",
+    )
+    parser.add_argument(
+        "--batch_size",
+        type=int,
+        default=8,
+        help="Batch size for generation (number of samples per model.generate call)",
     )
     args = parser.parse_args()
 
@@ -275,7 +330,7 @@ def main():
     # 4. Open output and write val + train, then stream generated
     os.makedirs(os.path.dirname(args.output_path) or ".", exist_ok=True)
     total_generated = sum(k for _, _, k in generation_plan)
-    print(f"Writing validation ({len(val_rows)}), then train ({len(train_rows)}), then {total_generated} generated rows to {args.output_path}")
+    print(f"Writing validation ({len(val_rows)}), then train ({len(train_rows)}), then {total_generated} generated rows to {args.output_path} (batch_size={args.batch_size})")
 
     with open(args.output_path, "w", encoding="utf-8") as out_f:
         def write_row(par_id: int, text: str, label: int) -> None:
@@ -291,9 +346,11 @@ def main():
         skipped = 0
         for seed_text, label, k in tqdm(generation_plan, desc="Generating"):
             prompt = build_generation_prompt(seed_text, label)
-            for _ in range(k):
-                new_text = generate_one(
-                    prompt,
+            prompts_batch = [prompt] * k
+            for start in range(0, k, args.batch_size):
+                batch_prompts = prompts_batch[start : start + args.batch_size]
+                new_texts = generate_batch(
+                    batch_prompts,
                     model,
                     tokenizer,
                     device,
@@ -301,11 +358,12 @@ def main():
                     temperature=args.temperature,
                     max_prompt_length=args.max_prompt_length,
                 )
-                if not new_text or not new_text.strip():
-                    skipped += 1
-                    continue
-                write_row(next_par_id, new_text, label)
-                next_par_id += 1
+                for new_text in new_texts:
+                    if not new_text or not new_text.strip():
+                        skipped += 1
+                        continue
+                    write_row(next_par_id, new_text, label)
+                    next_par_id += 1
         out_f.flush()
 
     if skipped:
