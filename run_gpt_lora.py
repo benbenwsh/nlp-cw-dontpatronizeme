@@ -333,6 +333,7 @@ class _MemoryEfficientEvalCallback(TrainerCallback):
         label_token_ids = [get_label_token_id(self.tokenizer, k) for k in range(5)]
         token_id_to_class = {tid: k for k, tid in enumerate(label_token_ids)}
         eval_batch_size = getattr(args, "per_device_eval_batch_size", 8)
+        print(f"Eval batch size: {eval_batch_size}")
         dataloader = DataLoader(
             self.eval_dataset,
             batch_size=eval_batch_size,
@@ -347,7 +348,16 @@ class _MemoryEfficientEvalCallback(TrainerCallback):
             for batch in dataloader:
                 batch = {k: v.to(device) for k, v in batch.items() if hasattr(v, "to")}
                 batch_size = batch["input_ids"].size(0)
-                outputs = model(**batch)
+                # outputs = model(**batch)
+                outputs = model.generate(
+                    input_ids=batch["input_ids"],
+                    attention_mask=batch["attention_mask"],
+                    max_new_tokens=1,
+                    do_sample=False,
+                    pad_token_id=self.tokenizer.pad_token_id or self.tokenizer.eos_token_id,
+                    logits_processor=[ConstrainedDigitLogitsProcessor(get_digit_token_ids(self.tokenizer))],
+                )
+                # Be careful with the loss it is after the epoch
                 loss = outputs.loss
                 total_loss += loss.item() * batch_size
                 n_samples += batch_size
@@ -487,8 +497,11 @@ def train_lora(args, tokenizer, train_examples, few_shot):
     dev_ids = load_dev_par_ids(args.dev_path)
     all_data = load_cleaned_data(args.data_path)
     eval_examples = [(all_data[par_id][0], all_data[par_id][1]) for par_id in dev_ids if par_id in all_data]
+    if args.eval_proportion < 1.0:
+        k = max(1, int(len(eval_examples) * args.eval_proportion))
+        eval_examples = random.sample(eval_examples, k)
     eval_dataset = PCLDataset(eval_examples, tokenizer, max_length, few_shot)
-    print(f"Eval examples (dev): {len(eval_dataset)}")
+    print(f"Eval examples (dev): {len(eval_dataset)}" + (f" (subsampled to {args.eval_proportion:.2%})" if args.eval_proportion < 1.0 else ""))
 
     data_collator = PCLDataCollator(tokenizer=tokenizer, pad_to_multiple_of=8)
 
@@ -551,7 +564,12 @@ def run_validation(args, tokenizer, few_shot):
             validation_list.append((par_id, text, label))
         else:
             print(f"WARNING: par_id {par_id} not in cleaned data")
-    print(f"Validation samples: {len(validation_list)}")
+    if args.eval_proportion < 1.0:
+        k = max(1, int(len(validation_list) * args.eval_proportion))
+        validation_list = random.sample(validation_list, k)
+        print(f"Validation samples: {len(validation_list)} (subsampled to {args.eval_proportion:.2%})")
+    else:
+        print(f"Validation samples: {len(validation_list)}")
 
     gold_binary = [class_04_to_binary(l) for (_, _, l) in validation_list]
     par_ids_ordered = [p for (p, _, _) in validation_list]
@@ -560,6 +578,7 @@ def run_validation(args, tokenizer, few_shot):
     logits_processor = ConstrainedDigitLogitsProcessor(digit_token_ids)
     device = next(model.parameters()).device
     batch_size = max(1, args.batch_size)
+    print(f"Validation batch size: {batch_size}")
 
     predictions_04 = []
     for start in tqdm(range(0, len(validation_list), batch_size), desc="Generating"):
@@ -661,11 +680,28 @@ def main():
     parser.add_argument("--batch_size", type=int, default=1, help="Batch size for validation generation")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
+        "--train_proportion",
+        type=float,
+        default=1.0,
+        help="Proportion of training examples to use (0-1), chosen randomly (default: 1.0)",
+    )
+    parser.add_argument(
+        "--eval_proportion",
+        type=float,
+        default=1.0,
+        help="Proportion of eval/dev examples to use (0-1), chosen randomly (default: 1.0)",
+    )
+    parser.add_argument(
         "--eval_only",
         action="store_true",
         help="Skip training; load saved adapter and run validation only",
     )
     args = parser.parse_args()
+
+    if not (0 <= args.train_proportion <= 1):
+        parser.error("--train_proportion must be in the range [0, 1]")
+    if not (0 <= args.eval_proportion <= 1):
+        parser.error("--eval_proportion must be in the range [0, 1]")
 
     random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -692,7 +728,12 @@ def main():
         run_validation(args, tokenizer, few_shot)
     else:
         train_examples = load_pcl_train(args.data_path, dev_ids)
-        print(f"Training examples (PCL minus dev): {len(train_examples)}")
+        if args.train_proportion < 1.0:
+            k = max(1, int(len(train_examples) * args.train_proportion))
+            train_examples = random.sample(train_examples, k)
+            print(f"Training examples (PCL minus dev): {len(train_examples)} (subsampled to {args.train_proportion:.2%})")
+        else:
+            print(f"Training examples (PCL minus dev): {len(train_examples)}")
         # Phase 1 & 2: Train LoRA and save
         train_lora(args, tokenizer, train_examples, few_shot)
         # Phase 3: Validation
