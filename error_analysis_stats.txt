@@ -35,10 +35,10 @@ Part 4: Predicted class distribution (all dev predictions)
   Class 3: count=84, pct=4.01%
   Class 4: count=60, pct=2.87%
 
-Part 5: Gold class distribution (full dev set)
+Part 5: Gold class distribution (training set)
 ----------------------------------------
-  Class 0: count=1704, pct=81.38%
-  Class 1: count=191, pct=9.12%
-  Class 2: count=18, pct=0.86%
-  Class 3: count=89, pct=4.25%
-  Class 4: count=92, pct=4.39%
+  Class 0: count=6825, pct=81.49%
+  Class 1: count=756, pct=9.03%
+  Class 2: count=126, pct=1.50%
+  Class 3: count=369, pct=4.41%
+  Class 4: count=299, pct=3.57%

@@ -5,7 +5,7 @@ Part 1: Errors by keyword (binary 0/1 wrong).
 Part 2: Errors by gold class 0-4 (count + percentage), two bar charts.
 Part 3: Length distribution (correct vs incorrect).
 Part 4: Predicted class distribution (0-4) over all dev predictions (bar chart + stats).
-Part 5: Gold class distribution (0-4) in full dev set (bar chart + stats).
+Part 5: Gold class distribution (0-4) in training set (bar chart + stats).
 Uses dev_semeval_parids-labels.csv, output/cleaned.tsv, dev_results.txt, dev_04.txt;
 for Part 1 only, dontpatronizeme_pcl.tsv for keyword.
 """
@@ -167,9 +167,14 @@ def main():
         else:
             lengths_correct.append(nwords)
 
-    # --- Part 4 & 5: Predicted class (all dev) and gold class (full dev) ---
+    # --- Part 4 & 5: Predicted class (all dev) and gold class (training set) ---
     pred_class_counts = Counter(pred_04)
-    gold_class_counts = Counter(g for g in gold_04 if g >= 0)
+    dev_id_set = set(dev_ids)
+    # Training set = all cleaned data not in dev
+    gold_class_counts = Counter(
+        label for par_id, (_, label) in all_data.items()
+        if par_id not in dev_id_set and label in (0, 1, 2, 3, 4)
+    )
 
     # --- Write stats file ---
     stats_path = os.path.join(args.output_dir, "error_analysis_stats.txt")
@@ -212,13 +217,13 @@ def main():
             f.write(f"  Class {c}: count={cnt}, pct={pct:.2f}%\n")
         f.write("\n")
 
-        # Part 5: Gold class distribution (full dev set)
-        n_dev = sum(gold_class_counts.values())
-        f.write("Part 5: Gold class distribution (full dev set)\n")
+        # Part 5: Gold class distribution (training set)
+        n_train = sum(gold_class_counts.values())
+        f.write("Part 5: Gold class distribution (training set)\n")
         f.write("-" * 40 + "\n")
         for c in range(5):
             cnt = gold_class_counts.get(c, 0)
-            pct = (100.0 * cnt / n_dev) if n_dev else 0.0
+            pct = (100.0 * cnt / n_train) if n_train else 0.0
             f.write(f"  Class {c}: count={cnt}, pct={pct:.2f}%\n")
     print(f"Wrote {stats_path}")
 
@@ -326,16 +331,16 @@ def main():
     plt.close()
     print(f"Wrote {out}")
 
-    # Part 5: Gold class distribution (full dev set)
+    # Part 5: Gold class distribution (training set)
     gold_counts = [gold_class_counts.get(c, 0) for c in classes]
     fig, ax = plt.subplots()
     ax.bar(classes, gold_counts)
     ax.set_xlabel("Gold class")
     ax.set_ylabel("Count")
-    ax.set_title("Part 5: Gold class distribution (full dev set)")
+    ax.set_title("Part 5: Gold class distribution (training set)")
     ax.set_xticks(classes)
     plt.tight_layout()
-    out = os.path.join(args.output_dir, "error_analysis_gold_class_dev_bars.png")
+    out = os.path.join(args.output_dir, "error_analysis_gold_class_train_bars.png")
     plt.savefig(out, dpi=150)
     plt.close()
     print(f"Wrote {out}")
