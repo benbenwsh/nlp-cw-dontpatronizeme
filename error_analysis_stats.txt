@@ -26,3 +26,19 @@ Part 3: Length (word count) summary
 ----------------------------------------
   Incorrect: n=135, mean=53.8
   Correct:   n=1959, mean=47.0
+
+Part 4: Predicted class distribution (incorrect examples only)
+----------------------------------------
+  Class 0: count=38, pct=28.15%
+  Class 1: count=57, pct=42.22%
+  Class 2: count=0, pct=0.00%
+  Class 3: count=33, pct=24.44%
+  Class 4: count=7, pct=5.19%
+
+Part 5: Gold class distribution (full dev set)
+----------------------------------------
+  Class 0: count=1704, pct=81.38%
+  Class 1: count=191, pct=9.12%
+  Class 2: count=18, pct=0.86%
+  Class 3: count=89, pct=4.25%
+  Class 4: count=92, pct=4.39%

@@ -4,6 +4,8 @@ Error analysis for mistral_7b_pcl_lora_6_epochs dev predictions.
 Part 1: Errors by keyword (binary 0/1 wrong).
 Part 2: Errors by gold class 0-4 (count + percentage), two bar charts.
 Part 3: Length distribution (correct vs incorrect).
+Part 4: Predicted class distribution (0-4) among incorrect examples only (bar chart + stats).
+Part 5: Gold class distribution (0-4) in full dev set (bar chart + stats).
 Uses dev_semeval_parids-labels.csv, output/cleaned.tsv, dev_results.txt, dev_04.txt;
 for Part 1 only, dontpatronizeme_pcl.tsv for keyword.
 """
@@ -165,6 +167,11 @@ def main():
         else:
             lengths_correct.append(nwords)
 
+    # --- Part 4 & 5: Predicted class (incorrect only) and gold class (full dev) ---
+    pred_on_incorrect = [pred_04[i] for i in range(len(dev_ids)) if dev_ids[i] in incorrect_par_ids]
+    pred_class_counts = Counter(pred_on_incorrect)
+    gold_class_counts = Counter(g for g in gold_04 if g >= 0)
+
     # --- Write stats file ---
     stats_path = os.path.join(args.output_dir, "error_analysis_stats.txt")
     with open(stats_path, "w", encoding="utf-8") as f:
@@ -194,6 +201,26 @@ def main():
             f.write(f"  Incorrect: n={len(lengths_incorrect)}, mean={sum(lengths_incorrect)/len(lengths_incorrect):.1f}\n")
         if lengths_correct:
             f.write(f"  Correct:   n={len(lengths_correct)}, mean={sum(lengths_correct)/len(lengths_correct):.1f}\n")
+        f.write("\n")
+
+        # Part 4: Predicted class distribution (incorrect examples only)
+        n_incorrect = len(pred_on_incorrect)
+        f.write("Part 4: Predicted class distribution (incorrect examples only)\n")
+        f.write("-" * 40 + "\n")
+        for c in range(5):
+            cnt = pred_class_counts.get(c, 0)
+            pct = (100.0 * cnt / n_incorrect) if n_incorrect else 0.0
+            f.write(f"  Class {c}: count={cnt}, pct={pct:.2f}%\n")
+        f.write("\n")
+
+        # Part 5: Gold class distribution (full dev set)
+        n_dev = sum(gold_class_counts.values())
+        f.write("Part 5: Gold class distribution (full dev set)\n")
+        f.write("-" * 40 + "\n")
+        for c in range(5):
+            cnt = gold_class_counts.get(c, 0)
+            pct = (100.0 * cnt / n_dev) if n_dev else 0.0
+            f.write(f"  Class {c}: count={cnt}, pct={pct:.2f}%\n")
     print(f"Wrote {stats_path}")
 
     # --- Charts (matplotlib) ---
@@ -281,6 +308,35 @@ def main():
     ax.legend()
     plt.tight_layout()
     out = os.path.join(args.output_dir, "error_analysis_length_dist.png")
+    plt.savefig(out, dpi=150)
+    plt.close()
+    print(f"Wrote {out}")
+
+    # Part 4: Predicted class distribution (incorrect examples only)
+    classes = list(range(5))
+    pred_counts = [pred_class_counts.get(c, 0) for c in classes]
+    fig, ax = plt.subplots()
+    ax.bar(classes, pred_counts)
+    ax.set_xlabel("Predicted class")
+    ax.set_ylabel("Count")
+    ax.set_title("Part 4: Predicted class distribution (incorrect examples only)")
+    ax.set_xticks(classes)
+    plt.tight_layout()
+    out = os.path.join(args.output_dir, "error_analysis_pred_class_incorrect_bars.png")
+    plt.savefig(out, dpi=150)
+    plt.close()
+    print(f"Wrote {out}")
+
+    # Part 5: Gold class distribution (full dev set)
+    gold_counts = [gold_class_counts.get(c, 0) for c in classes]
+    fig, ax = plt.subplots()
+    ax.bar(classes, gold_counts)
+    ax.set_xlabel("Gold class")
+    ax.set_ylabel("Count")
+    ax.set_title("Part 5: Gold class distribution (full dev set)")
+    ax.set_xticks(classes)
+    plt.tight_layout()
+    out = os.path.join(args.output_dir, "error_analysis_gold_class_dev_bars.png")
     plt.savefig(out, dpi=150)
     plt.close()
     print(f"Wrote {out}")
